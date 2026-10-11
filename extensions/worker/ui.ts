@@ -312,8 +312,9 @@ export function renderWorkerDetails(details: WorkerUiDetails, theme: Theme, opti
 		const duration = uiDuration(task, options.snapshot ? details.snapshotAt ?? details.finishedAt ?? details.startedAt : Date.now());
 		const usage = workerUsageText(task.usage, task.status === "running");
 		const preset = task.resolvedPreset ?? task.requestedPreset;
-		const runtime = [preset, task.sessionMode === "fork" ? "fork" : undefined, usage, duration].filter(Boolean).join(" · ");
-		text += `${uiStatusIcon(task.status, theme)} ${theme.fg("accent", task.mode)}${runtime ? theme.fg("muted", ` · ${runtime}`) : ""}`;
+		const sessionIcon = task.sessionMode === "fork" ? "" : task.sessionMode === "new" ? "󰐖" : undefined;
+		const runtime = [preset, usage, duration].filter(Boolean).join(" · ");
+		text += `${uiStatusIcon(task.status, theme)} ${theme.fg("accent", task.mode)}${sessionIcon ? ` ${theme.fg("muted", sessionIcon)}` : ""}${runtime ? theme.fg("muted", ` · ${runtime}`) : ""}`;
 		const objective = sanitizeUiText(task.objective).replace(/\s+/g, " ").trim();
 		text += `\n  ${theme.fg("toolOutput", objective)}`;
 		const conclusions = workerConclusions(task);

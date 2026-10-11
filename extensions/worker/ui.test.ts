@@ -87,6 +87,35 @@ test("worker details omit batch and scheduling rows while retaining task and tim
 	}
 });
 
+test("worker details retain status icons and render session icons in the preset color", () => {
+	const colors: Array<[string, string]> = [];
+	const theme = { fg: (color: string, text: string) => { colors.push([color, text]); return text; } } as Theme;
+	for (const sessionMode of ["new", "fork"] as const) {
+		for (const status of ["queued", "running", "completed", "blocked", "failed"] as const) {
+			const details: WorkerUiDetails = {
+				kind: "worker-ui", startedAt: 1, limit: 1, total: 1, completed: 0,
+				tasks: [{
+					index: 0, mode: "scout", objective: "inspect", status, sessionMode,
+					requestedPreset: "fast", attempt: 0, phase: "fixture", activities: [], toolCalls: 0,
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0, turns: 0 },
+				}],
+			};
+			for (const expanded of [false, true]) {
+				for (const snapshot of [false, true]) {
+					colors.length = 0;
+					const header = renderWorkerDetails(details, theme, { expanded, snapshot }).render(120)[0];
+					const icon = sessionMode === "fork" ? "" : "󰐖";
+					const statusIcon = { queued: "○", running: "◌", completed: "✓", blocked: "!", failed: "✗" }[status];
+					assert.ok(header.startsWith(`${statusIcon} scout ${icon} · fast`), `${sessionMode}/${status}/${expanded}/${snapshot}: ${header}`);
+					assert.ok(!header.includes(` · ${icon}`), "session icon must not be a dot-separated runtime field");
+					assert.equal(colors.find(([, text]) => text === icon)?.[0], "muted");
+					assert.equal(colors.find(([, text]) => text.startsWith(" · fast"))?.[0], "muted");
+				}
+			}
+		}
+	}
+});
+
 test("worker details display the complete objective", () => {
 	const objective = `检查并修复 Worker 工具目标显示。${"完整目标内容".repeat(30)}目标结束`;
 	const details: WorkerUiDetails = {
