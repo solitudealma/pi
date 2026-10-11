@@ -21,6 +21,7 @@ export function workerBranchSnapshots(branch: readonly any[]): Map<string, Worke
 		for (const part of entry.message.content ?? []) {
 			if (part.type !== "toolCall" || part.name !== "worker") continue;
 			calls.set(part.id, part.arguments);
+			// Legacy task input is recognized only when restoring historical cards.
 			if (part.arguments && !part.arguments.batchId && (part.arguments.task || part.arguments.tasks)) starts.add(part.id);
 		}
 	}

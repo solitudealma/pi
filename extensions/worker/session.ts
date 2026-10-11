@@ -15,7 +15,7 @@ export function captureWorkerSession(manager: Pick<ExtensionContext["sessionMana
 }
 
 export async function workerSessionArgs(task: WorkerTask, cwd: string, tempDir: string, snapshot?: WorkerSessionSnapshot): Promise<string[]> {
-	const mode = task.sessionMode === undefined ? "fork" : task.sessionMode;
+	const mode = task.sessionMode;
 	if (mode === "new") return ["--no-session"];
 	if (mode !== "fork") throw new Error(`无效 sessionMode: ${String(mode)}`);
 	if (!snapshot) throw new Error("fork Worker 缺少主会话活动分支快照");

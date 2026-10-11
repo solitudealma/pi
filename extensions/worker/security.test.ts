@@ -14,8 +14,8 @@ import { validateWorkerWritePath } from "./guard.ts";
 
 const workerTasksConflict = (left: WorkerTask, right: WorkerTask, cwd: string) => workerTaskScopesConflict(left, cwd, right, cwd);
 
-const readTask = (cwd?: string): WorkerTask => ({ mode: "scout", objective: "read", cwd });
-const writeTask = (allowedPaths: string[], cwd?: string): WorkerTask => ({ mode: "implement", objective: "write", allowedPaths, cwd });
+const readTask = (cwd?: string): WorkerTask => ({ mode: "scout", preset: "normal", sessionMode: "fork", objective: "read", cwd });
+const writeTask = (allowedPaths: string[], cwd?: string): WorkerTask => ({ mode: "implement", preset: "normal", sessionMode: "fork", objective: "write", allowedPaths, cwd });
 
 async function workspace(t: test.TestContext): Promise<string> {
 	const root = await mkdtemp(join(tmpdir(), "worker-security-"));
@@ -76,6 +76,19 @@ test("symlink aliases resolve to one write boundary", async (t) => {
 	assert.equal(workerTasksConflict(writeTask(["alias/**"]), writeTask(["real/**"]), root), true);
 });
 
+test("path boundaries preserve filename whitespace and distinguish dot names from parent traversal", async (t) => {
+	const root = await workspace(t);
+	await mkdir(join(root, " spaced"));
+	await mkdir(join(root, "..cache"));
+	assert.equal(workerTasksConflict(writeTask([" spaced/**"]), writeTask(["new.ts"], " spaced"), root), true);
+	assert.equal(workerTasksConflict(writeTask(["..cache/**"]), writeTask(["new.ts"], "..cache"), root), true);
+	assert.equal(workerTasksConflict(writeTask(["..cache/**"]), writeTask(["..cache/..file.ts"]), root), true);
+	const policy = { mode: "implement" as const, cwd: root, allowedPaths: ["..cache/**", " spaced/**"], forbiddenPaths: [] };
+	assert.equal(validateWorkerWritePath(policy, "..cache/..file.ts"), undefined);
+	assert.equal(validateWorkerWritePath(policy, " spaced/new.ts"), undefined);
+	assert.match(validateWorkerWritePath(policy, "../escape.ts")!, /越出/);
+});
+
 test("dangling symlink boundaries are unknown and conflict conservatively", async (t) => {
 	const root = await workspace(t);
 	await mkdir(join(root, "other"), { recursive: true });
@@ -110,6 +123,30 @@ test("changed-file filtering matches exact literal and glob guard semantics", as
 	assert.deepEqual(filterChangedFilesToBoundary(writeTask(["src"]), root, ["src", "src/file.ts"]), ["src"]);
 	assert.deepEqual(filterChangedFilesToBoundary(writeTask(["src/**"]), root, ["src", "src/file.ts"]), ["src/file.ts"]);
 	assert.deepEqual(filterChangedFilesToBoundary(writeTask(["src/*.ts"]), root, ["src/file.ts", "src/file.js", "src/nested/file.ts"]), ["src/file.ts"]);
+});
+
+test("nested aliases cannot escape canonical write scopes or forbidden targets", async (t) => {
+	const root = await workspace(t);
+	await mkdir(join(root, "left"));
+	await mkdir(join(root, "right"));
+	await writeFile(join(root, "right", "existing.ts"), "");
+	await symlink(join(root, "right"), join(root, "left", "link"), "dir");
+	await symlink(join(root, "right", "existing.ts"), join(root, "left", "file-alias"), "file");
+	const policy = { mode: "implement" as const, cwd: root, allowedPaths: ["left/**"], forbiddenPaths: [] as string[] };
+	for (const file of ["left/link/existing.ts", "left/link/new/deep.ts", "left/file-alias"]) {
+		assert.match(validateWorkerWritePath(policy, file)!, /超出 allowedPaths/);
+		assert.match(validateWorkerWritePath({ ...policy, allowedPaths: ["left/**", "right/**"], forbiddenPaths: ["right/**"] }, file)!, /命中 forbiddenPaths/);
+	}
+	assert.match(validateWorkerWritePath({ ...policy, allowedPaths: ["right/**"], forbiddenPaths: ["left/link/**"] }, "right/new.ts")!, /命中 forbiddenPaths/);
+	// Explicit alias prefixes retain their meaning, and the scheduler locks their real targets.
+	assert.equal(validateWorkerWritePath({ ...policy, allowedPaths: ["left/link/**"] }, "left/link/new.ts"), undefined);
+	assert.equal(workerTasksConflict(writeTask(["left/link/**"]), writeTask(["right/**"]), root), true);
+	assert.equal(validateWorkerWritePath({ ...policy, allowedPaths: ["left/file-alias"] }, "left/file-alias"), undefined);
+	assert.equal(workerTasksConflict(writeTask(["left/file-alias"]), writeTask(["right/existing.ts"]), root), true);
+	// A broad subtree remains independent only because escaping aliases above are denied.
+	assert.equal(workerTasksConflict(writeTask(["left/**"]), writeTask(["right/**"]), root), false);
+	assert.equal(validateWorkerWritePath({ ...policy, allowedPaths: ["left/**", "right/**"] }, "left/link/new.ts"), undefined);
+	assert.equal(workerTasksConflict(writeTask(["left/**", "right/**"]), writeTask(["right/**"]), root), true);
 });
 
 test("write guard keeps exact file and subtree glob semantics without widening bare paths", async (t) => {

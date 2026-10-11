@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { until } from "./fixtures/helpers.ts";
 
 const fixture = fileURLToPath(new URL("./fixtures/parent.mjs", import.meta.url));
-const task = (objective = "hang") => ({ task: { mode: "scout", objective } });
+const task = (objective = "hang") => ({ tasks: [{ mode: "scout", preset: "normal", sessionMode: "fork", objective }] });
 function workspace() {
 	const cwd = mkdtempSync(join(tmpdir(), "worker-isolation-"));
 	execFileSync("git", ["init", "--quiet", cwd]);
@@ -80,13 +80,13 @@ test("real loader instances isolate slots, shutdown and subsequent work", { time
 		await waitReady(p, 2);
 		assert.equal((await p.call("stats")).owners.length, 2);
 		await p.call("shutdown", { session: "a" });
-		assert.equal((await workA).result.execution.termination.source, "session_shutdown");
+		assert.equal((await workA).result.results[0].execution.termination.source, "session_shutdown");
 		assert.equal((await p.call("stats")).owners.length, 1);
 		await p.call("shutdown", { session: "b" });
-		assert.equal((await workB).result.execution.cancelled, true);
+		assert.equal((await workB).result.results[0].execution.cancelled, true);
 		assertReleased(await p.call("stats"));
 		await p.call("restart", { session: "a" });
-		assert.equal((await p.call("call", { session: "a", input: task("done") })).result.status, "completed");
+		assert.equal((await p.call("call", { session: "a", input: task("done") })).result.results[0].status, "completed");
 	} finally { await p.dispose(); repo.dispose(); }
 });
 
@@ -98,10 +98,10 @@ test("two OS parents in the same cwd isolate process groups and lifecycle", { ti
 		await Promise.all([waitReady(a), waitReady(b)]);
 		const before = await b.call("stats");
 		await a.call("shutdown");
-		assert.equal((await workA).result.execution.cancelled, true);
+		assert.equal((await workA).result.results[0].execution.cancelled, true);
 		assert.deepEqual((await b.call("stats")).owners, before.owners);
 		await b.call("shutdown");
-		assert.equal((await workB).result.execution.cancelled, true);
+		assert.equal((await workB).result.results[0].execution.cancelled, true);
 		assertReleased(await a.call("stats")); assertReleased(await b.call("stats"));
 	} finally { await a.dispose(); await b.dispose(); repo.dispose(); }
 });
@@ -117,10 +117,10 @@ test("exit fallback spans loader generations without cancelling fresh sessions o
 		await waitReady(p, 2);
 		assert.equal((await p.call("stats")).modules, 2);
 		await p.call("shutdown", { session: "old" });
-		assert.equal((await old).result.execution.cancelled, true);
+		assert.equal((await old).result.results[0].execution.cancelled, true);
 		assert.equal((await p.call("stats")).owners.length, 1);
 		await p.call("exit-hooks");
-		assert.notEqual((await fresh).result.status, "completed");
+		assert.notEqual((await fresh).result.results[0].status, "completed");
 		assertReleased(await p.call("stats"));
 	} finally { await p.dispose(); repo.dispose(); }
 });
@@ -131,10 +131,10 @@ test("model-free child returns blocked without interaction and next batch can ru
 		await p.call("load");
 		const result = await p.call("call", { input: task("blocked") });
 		assert.equal(result.finished, true);
-		assert.equal(result.result.status, "blocked");
-		assert.equal(result.result.failure.category, "worker_blocked");
+		assert.equal(result.result.results[0].status, "blocked");
+		assert.equal(result.result.results[0].failure.category, "worker_blocked");
 		assertReleased(await p.call("stats"));
-		assert.equal((await p.call("call", { input: task("done") })).result.status, "completed");
+		assert.equal((await p.call("call", { input: task("done") })).result.results[0].status, "completed");
 	} finally { await p.dispose(); repo.dispose(); }
 });
 
@@ -143,7 +143,7 @@ test("cancel retains original PGID, slot and runtime lock after leader closes un
 	let group: { leader: number; grandchild: number } | undefined;
 	try {
 		await p.call("load");
-		const work = p.call("call", { input: { task: { mode: "fix", objective: "group-stubborn", allowedPaths: ["fixture-group.json"] } } });
+		const work = p.call("call", { input: { tasks: [{ mode: "fix", preset: "normal", sessionMode: "fork", objective: "group-stubborn", allowedPaths: ["fixture-group.json"] }] } });
 		void work.catch(() => {});
 		await waitReady(p);
 		group = JSON.parse(readFileSync(join(repo.cwd, "fixture-group.json"), "utf8"));
@@ -165,7 +165,7 @@ test("cancel retains original PGID, slot and runtime lock after leader closes un
 		const result = await work;
 		const elapsed = Date.now() - started;
 		assert.ok(elapsed >= 2_900 && elapsed < 5_500, `original three-second escalation remains bounded: ${elapsed}ms`);
-		assert.equal(result.result.execution.cancelled, true);
+		assert.equal(result.result.results[0].execution.cancelled, true);
 		assert.equal(processRunning(group!.grandchild), false);
 		assertReleased(await p.call("stats"));
 		t.diagnostic(`leader closed early; resistant same-PGID grandchild stopped; cleanup ${elapsed}ms`);
@@ -198,8 +198,8 @@ for (const scenario of [
 		const result = await work;
 		const elapsed = Date.now() - started;
 		assert.equal(result.finished, true);
-		assert.equal(result.result.status, scenario.cancel ? "failed" : "completed");
-		if (scenario.cancel) assert.equal(result.result.execution.cancelled, true);
+		assert.equal(result.result.results[0].status, scenario.cancel ? "failed" : "completed");
+		if (scenario.cancel) assert.equal(result.result.results[0].execution.cancelled, true);
 		assert.ok(elapsed < 2_500, `no unnecessary three-second grace: ${elapsed}ms`);
 		const stats = await p.call("stats");
 		if (scenario.update) assert.ok(stats.updates.includes(scenario.update === "all" ? "子进程已完成" : scenario.update), "target onUpdate actually threw");
@@ -209,7 +209,7 @@ for (const scenario of [
 		await p.call("shutdown");
 		await p.call("restart");
 		await p.call("presentation");
-		assert.equal((await p.call("call", { input: task("done") })).result.status, "completed");
+		assert.equal((await p.call("call", { input: task("done") })).result.results[0].status, "completed");
 		assertReleased(await p.call("stats"));
 		t.diagnostic(`${scenario.name}: settled and shutdown completed (${elapsed}ms), subsequent work completed`);
 	} finally { await p.dispose(); repo.dispose(); }

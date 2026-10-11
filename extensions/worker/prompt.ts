@@ -23,7 +23,7 @@ export function buildTaskPrompt(task: WorkerTask, before: WorkspaceSnapshot | nu
 	const existing = before ? [...before.statusPaths].map((item) => path.relative(before.cwd, path.join(before.gitRoot, item)).replaceAll("\\", "/")) : [];
 	const contract: Record<string, unknown> = {
 		mode: task.mode,
-		sessionMode: task.sessionMode ?? "fork",
+		sessionMode: task.sessionMode,
 		objective: task.objective.trim(),
 		cwd: before?.cwd,
 		allowedPaths: task.allowedPaths ?? [],

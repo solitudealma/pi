@@ -5,7 +5,7 @@ import * as path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_OPTIONS, validateTask } from "./config.ts";
+import { DEFAULT_OPTIONS, THINKING_LEVELS, validateTask } from "./config.ts";
 import { until } from "./fixtures/helpers.ts";
 import workerExtension, { validateWorkerInput } from "./index.ts";
 import { acquireSlot, baseExecution, createWorkerOwner, runPiWorker } from "./process.ts";
@@ -14,7 +14,7 @@ import { captureWorkerSession, workerSessionArgs, type WorkerSessionSnapshot } f
 import type { Route, WorkerTask } from "./types.ts";
 import { compactWorkerResult, emptyWorkerUsage, renderWorkerDetails } from "./ui.ts";
 
-const task: WorkerTask = { mode: "scout", objective: "fixture" };
+const task: WorkerTask = { mode: "scout", preset: "normal", sessionMode: "fork", objective: "fixture" };
 const route: Route = { requestedPreset: "normal", resolvedPreset: "normal", modelId: "fixture/local", provider: "fixture", thinking: "high", routeReason: [] };
 const message = (content: string) => ({ role: "user" as const, content, timestamp: 1 });
 const probe = fileURLToPath(new URL("./fixtures/session-probe.mjs", import.meta.url));
@@ -45,24 +45,26 @@ function launch(mode: WorkerTask["sessionMode"], snapshot?: WorkerSessionSnapsho
 	return runPiWorker({ ...task, sessionMode: mode }, route, process.cwd(), "worker-system-fixture", prompt, signal, timeout, 1, onProgress, { owner: createWorkerOwner(), sessionSnapshot: snapshot, ...extra });
 }
 
-test("sessionMode schema and direct validation accept only omitted/new/fork", async (t) => {
-	for (const sessionMode of [undefined, "new", "fork"] as const) {
-		const value = { ...task, ...(sessionMode ? { sessionMode } : {}) };
-		assert.doesNotThrow(() => validateWorkerInput({ task: value }));
+test("sessionMode is required in schema and direct validation; only new/fork are accepted", async (t) => {
+	for (const sessionMode of ["new", "fork"] as const) {
+		const value = { ...task, sessionMode };
+		assert.doesNotThrow(() => validateWorkerInput({ tasks: [value] }));
 		assert.doesNotThrow(() => validateWorkerInput({ tasks: [task, value] }));
 		assert.deepEqual(validateTask(value, process.cwd()), []);
-		assert.equal(baseExecution(value, route, 1, []).session_mode, sessionMode ?? "fork");
-		assert.match(buildTaskPrompt(value, null), new RegExp(`"sessionMode":"${sessionMode ?? "fork"}"`));
+		assert.equal(baseExecution(value, route, 1, []).session_mode, sessionMode);
+		assert.match(buildTaskPrompt(value, null), new RegExp(`"sessionMode":"${sessionMode}"`));
 	}
 	const dir = temp(t);
-	for (const sessionMode of ["", "clone", "NEW", null, false, 0, {}]) {
+	for (const sessionMode of [undefined, "", "clone", "NEW", null, false, 0, {}]) {
 		const value = { ...task, sessionMode } as WorkerTask;
-		assert.throws(() => validateWorkerInput({ task: value }), /参数错误/);
+		assert.throws(() => validateWorkerInput({ tasks: [value] }), /参数错误/);
 		assert.ok(validateTask(value, process.cwd()).some((error) => error.includes("sessionMode")));
 		await assert.rejects(workerSessionArgs(value, dir, dir), /sessionMode/);
 	}
 	await assert.rejects(workerSessionArgs({ ...task, sessionMode: "fork" }, dir, dir), /快照/);
-	await assert.rejects(workerSessionArgs(task, dir, dir), /快照/);
+	const { sessionMode: _omitted, ...missing } = task;
+	assert.throws(() => validateWorkerInput({ tasks: [missing] }), /参数错误/);
+	await assert.rejects(workerSessionArgs(missing as WorkerTask, dir, dir), /sessionMode/);
 });
 
 test("snapshot selects the active leaf, preserves compaction/edits and never mutates persistent or in-memory parents", async (t) => {
@@ -120,13 +122,13 @@ test("empty branch snapshots do not resurrect inactive history", async (t) => {
 	assert.deepEqual(SessionManager.open(args[1], dir).getBranch(), []);
 });
 
-test("real process arguments retain isolation guards; default/fork inherit context and explicit new is empty", async (t) => {
+test("real process arguments retain isolation guards; explicit fork inherits context and explicit new is empty", async (t) => {
 	useProbe(t);
 	const manager = SessionManager.inMemory(process.cwd());
 	manager.appendMessage(message("parent-visible"));
 	const snapshot = captureWorkerSession(manager);
 	const before = parentState(manager);
-	for (const mode of [undefined, "new", "fork"] as const) {
+	for (const mode of ["new", "fork"] as const) {
 		const result = await launch(mode, snapshot);
 		assert.equal(result.exitCode, 0, result.stderr);
 		const report = JSON.parse(result.assistantText);
@@ -154,6 +156,20 @@ test("real process arguments retain isolation guards; default/fork inherit conte
 		}
 	}
 	assert.equal(parentState(manager), before);
+});
+
+test("configured thinking is passed to the child unchanged at every supported level", async (t) => {
+	useProbe(t);
+	for (const thinking of THINKING_LEVELS) {
+		const result = await runPiWorker(
+			{ ...task, sessionMode: "new" }, { ...route, thinking },
+			process.cwd(), "worker-system-fixture", "inspect", undefined, 10_000, 1,
+			undefined, { owner: createWorkerOwner() },
+		);
+		assert.equal(result.exitCode, 0, result.stderr);
+		const report = JSON.parse(result.assistantText);
+		assert.equal(report.args[report.args.indexOf("--thinking") + 1], thinking);
+	}
 });
 
 test("fork temporary files are removed after child failure, cancellation, timeout and spawn failure", async (t) => {

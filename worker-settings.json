@@ -13,7 +13,6 @@
     "thinking": "high"
   },
   "maxConcurrentWorkers": 5,
-  "automaticDelegationEnabled": true,
   "defaultTimeoutMs": 1800000,
   "maxOutputBytes": 131072
 }

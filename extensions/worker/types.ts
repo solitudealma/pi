@@ -3,16 +3,15 @@
 
 export type WorkerMode = "scout" | "implement" | "test" | "review" | "fix";
 export type WorkerSessionMode = "new" | "fork";
-export type WorkerPreset = "auto" | "fast" | "normal" | "deep";
-export type Thinking = "high" | "xhigh" | "max";
-export type ResolvedPreset = Exclude<WorkerPreset, "auto">;
+export type WorkerPreset = "fast" | "normal" | "deep";
+export type Thinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface WorkerTask {
 	mode: WorkerMode;
 	objective: string;
-	preset?: WorkerPreset;
-	/** Defaults to fork: snapshots the parent's active branch at batch admission. */
-	sessionMode?: WorkerSessionMode;
+	preset: WorkerPreset;
+	/** Explicit fork snapshots the parent's active branch at batch admission. */
+	sessionMode: WorkerSessionMode;
 	context?: string;
 	relevantFiles?: string[];
 	allowedPaths?: string[];
@@ -24,10 +23,7 @@ export interface WorkerTask {
 }
 
 export interface WorkerToolInput {
-	task?: WorkerTask;
 	tasks?: WorkerTask[];
-	/** Required for calls made while automatic delegation is disabled in routing config. */
-	manual?: boolean;
 	batchId?: string;
 	cancel?: true;
 }
@@ -37,17 +33,16 @@ export interface PresetConfig {
 	thinking: Thinking;
 }
 
-export type RoutingConfig = Record<ResolvedPreset, PresetConfig> & {
+export type RoutingConfig = Record<WorkerPreset, PresetConfig> & {
 	version: number;
 	maxConcurrentWorkers: number;
-	automaticDelegationEnabled: boolean;
 	defaultTimeoutMs: number;
 	maxOutputBytes: number;
 };
 
 export interface Route {
 	requestedPreset: WorkerPreset;
-	resolvedPreset: ResolvedPreset;
+	resolvedPreset: WorkerPreset;
 	modelId: string;
 	provider: string;
 	thinking: Thinking;
@@ -103,7 +98,7 @@ export interface WorkerUiTask {
 	status: WorkerUiStatus;
 	requestedPreset: WorkerPreset;
 	sessionMode?: WorkerSessionMode;
-	resolvedPreset?: ResolvedPreset;
+	resolvedPreset?: WorkerPreset;
 	modelId?: string;
 	thinking?: Thinking;
 	attempt: number;

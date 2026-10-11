@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { isToolCallEventType, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isPathInside } from "./config.ts";
-import { matchesAny } from "./security.ts";
+import { canonicalizePotentialPath, matchesAny } from "./security.ts";
 import type { WorkerMode } from "./types";
 
 export const WORKER_MODE_ENV = "PI_WORKER_MODE";
@@ -40,47 +40,45 @@ export function loadWorkerWritePolicy(): WorkerWritePolicy {
 	return { mode, cwd, allowedPaths, forbiddenPaths };
 }
 
-function pathEntryExists(filePath: string): boolean {
-	try {
-		fs.lstatSync(filePath);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 export function guardedRelativePath(baseCwd: string, requestedPath: string): string {
 	if (!requestedPath.trim()) throw new Error("path 不能为空");
 	const candidate = path.resolve(baseCwd, requestedPath);
 	if (!isPathInside(baseCwd, candidate)) throw new Error(`path 越出 Worker cwd: ${requestedPath}`);
 
-	let ancestor = candidate;
-	while (!pathEntryExists(ancestor)) {
-		const parent = path.dirname(ancestor);
-		if (parent === ancestor) throw new Error(`无法解析 path: ${requestedPath}`);
-		ancestor = parent;
-	}
-	const realAncestor = fs.realpathSync(ancestor);
-	if (!isPathInside(baseCwd, realAncestor)) throw new Error(`path 通过符号链接越出 Worker cwd: ${requestedPath}`);
-	if (ancestor === candidate) {
-		const realTarget = fs.realpathSync(candidate);
-		if (!isPathInside(baseCwd, realTarget)) throw new Error(`path 通过符号链接越出 Worker cwd: ${requestedPath}`);
-	}
+	const realTarget = canonicalizePotentialPath(candidate);
+	if (!realTarget) throw new Error(`无法解析 path: ${requestedPath}`);
+	if (!isPathInside(baseCwd, realTarget)) throw new Error(`path 通过符号链接越出 Worker cwd: ${requestedPath}`);
 
 	return path.relative(baseCwd, candidate).replaceAll("\\", "/") || ".";
 }
 
+/** Match in the same canonical coordinates used by scheduler boundaries.
+ * Explicit alias prefixes are allowed; links below a glob cannot expand its scope.
+ */
+function matchesCanonicalPatterns(cwd: string, candidate: string, patterns: string[]): boolean {
+	return patterns.some((pattern) => {
+		const segments = pattern.replaceAll("\\", "/").split("/");
+		const wildcard = segments.findIndex((segment) => /[*?]/.test(segment));
+		const root = canonicalizePotentialPath(path.resolve(cwd, ...segments.slice(0, wildcard < 0 ? undefined : wildcard)));
+		if (!root) throw new Error(`无法解析写入范围: ${pattern}`);
+		if (wildcard < 0) return root === candidate;
+		if (!isPathInside(root, candidate)) return false;
+		return matchesAny(path.relative(root, candidate).replaceAll("\\", "/"), [segments.slice(wildcard).join("/")]);
+	});
+}
+
 export function validateWorkerWritePath(policy: WorkerWritePolicy, requestedPath: string): string | undefined {
 	if (!WRITE_MODES.has(policy.mode)) return `${policy.mode} 模式禁止调用 edit/write`;
-	let relativePath: string;
 	try {
-		relativePath = guardedRelativePath(policy.cwd, requestedPath);
+		const relativePath = guardedRelativePath(policy.cwd, requestedPath);
+		const target = canonicalizePotentialPath(path.resolve(policy.cwd, relativePath));
+		if (!target) throw new Error(`无法解析 path: ${requestedPath}`);
+		if (matchesAny(relativePath, policy.forbiddenPaths) || matchesCanonicalPatterns(policy.cwd, target, policy.forbiddenPaths)) return `edit/write path 命中 forbiddenPaths: ${relativePath}`;
+		if (!matchesAny(relativePath, policy.allowedPaths) || !matchesCanonicalPatterns(policy.cwd, target, policy.allowedPaths)) return `edit/write path 超出 allowedPaths: ${relativePath}`;
+		return undefined;
 	} catch (error) {
 		return error instanceof Error ? error.message : String(error);
 	}
-	if (matchesAny(relativePath, policy.forbiddenPaths)) return `edit/write path 命中 forbiddenPaths: ${relativePath}`;
-	if (!matchesAny(relativePath, policy.allowedPaths)) return `edit/write path 超出 allowedPaths: ${relativePath}`;
-	return undefined;
 }
 
 export function registerWorkerWriteGuard(pi: ExtensionAPI): void {

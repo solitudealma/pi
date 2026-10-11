@@ -3,19 +3,18 @@ import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
-import type { PresetConfig, ResolvedPreset, Route, RoutingConfig, Thinking, WorkerMode, WorkerTask } from "./types";
+import type { PresetConfig, Route, RoutingConfig, Thinking, WorkerMode, WorkerTask } from "./types";
 
 
 export const MODES = ["scout", "implement", "test", "review", "fix"] as const;
-export const PRESETS = ["auto", "fast", "normal", "deep"] as const;
+export const PRESETS = ["fast", "normal", "deep"] as const;
 export const SESSION_MODES = ["new", "fork"] as const;
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export const WRITE_MODES = new Set<WorkerMode>(["implement", "test", "fix"]);
-export const RESOLVED_PRESETS = ["fast", "normal", "deep"] as const;
 
 export const DEFAULT_OPTIONS = {
 	version: 2,
 	maxConcurrentWorkers: 3,
-	automaticDelegationEnabled: true,
 	defaultTimeoutMs: 900_000,
 	maxOutputBytes: 65_536,
 };
@@ -31,27 +30,19 @@ export function atomicWriteJson(filePath: string, value: unknown): void {
 	fs.renameSync(temp, filePath);
 }
 
-export function normalizeLegacyThinking(value: unknown, warnings: string[]): Thinking {
-	if (value === "xhigh" || value === "max" || value === "high") return value;
-	if (["off", "minimal", "low", "medium"].includes(String(value))) {
-		warnings.push(`旧 thinking 值 ${String(value)} 已兼容提升为 high`);
-		return "high";
-	}
-	return "high";
-}
-
 export function validateConfig(raw: RoutingConfig): { config: RoutingConfig; warnings: string[] } {
 	const warnings: string[] = [];
 	const config = structuredClone(raw);
 	delete (config as RoutingConfig & { maxAutomaticRetries?: unknown }).maxAutomaticRetries;
+	delete (config as RoutingConfig & { automaticDelegationEnabled?: unknown }).automaticDelegationEnabled;
 	delete (config as RoutingConfig & { max?: unknown }).max;
 	config.maxConcurrentWorkers = Math.max(1, Math.min(16, Number(config.maxConcurrentWorkers) || 3));
 	config.defaultTimeoutMs = Math.max(1_000, Math.min(3_600_000, Number(config.defaultTimeoutMs) || 900_000));
 	config.maxOutputBytes = Math.max(8_192, Math.min(1_048_576, Number(config.maxOutputBytes) || 65_536));
-	for (const preset of RESOLVED_PRESETS) {
+	for (const preset of PRESETS) {
 		const item = config[preset];
 		if (!item || typeof item.model !== "string" || !splitModelId(item.model)) throw new Error(`worker-settings.json 缺少有效的 ${preset}.model`);
-		item.thinking = normalizeLegacyThinking(item.thinking, warnings);
+		if (!THINKING_LEVELS.includes(item.thinking)) throw new Error(`worker-settings.json 无效的 ${preset}.thinking: ${String(item.thinking)}`);
 		delete (item as PresetConfig & { maxOutputBytes?: unknown }).maxOutputBytes;
 	}
 	return { config, warnings };
@@ -63,10 +54,10 @@ export function splitModelId(full: string): { provider: string; id: string } | n
 	return { provider: full.slice(0, slash), id: full.slice(slash + 1) };
 }
 
-export function supportedThinking(model: Model<any>): string[] {
+export function supportedThinking(model: Model<any>): Thinking[] {
 	if (!model.reasoning) return ["off"];
 	const map = (model as Model<any> & { thinkingLevelMap?: Record<string, string | null> }).thinkingLevelMap ?? {};
-	const levels = ["off", "minimal", "low", "medium", "high"];
+	const levels: Thinking[] = ["off", "minimal", "low", "medium", "high"];
 	if (typeof map.xhigh === "string") levels.push("xhigh");
 	if (typeof map.max === "string") levels.push("max");
 	return levels.filter((level) => map[level] !== null);
@@ -81,22 +72,23 @@ export function loadRoutingConfig(): { config: RoutingConfig; warnings: string[]
 	} catch (error) {
 		throw new Error(`worker-settings.json 无法解析，已保留原文件：${error instanceof Error ? error.message : String(error)}`);
 	}
-	const hadPresetOutputLimits = Boolean(current && typeof current === "object" && RESOLVED_PRESETS.some((preset) => {
+	const hadPresetOutputLimits = Boolean(current && typeof current === "object" && PRESETS.some((preset) => {
 		const setting = (current as Record<string, unknown>)[preset];
 		return Boolean(setting && typeof setting === "object" && "maxOutputBytes" in setting);
 	}));
 	const hadLegacyRetrySetting = Boolean(current && typeof current === "object" && "maxAutomaticRetries" in current);
+	const hadLegacyDelegationSetting = Boolean(current && typeof current === "object" && "automaticDelegationEnabled" in current);
 	const hadLegacyMaxPreset = Boolean(current && typeof current === "object" && "max" in current);
 	// Defaults are flat and parsed JSON cannot contain undefined values.
 	const missingDefaults = Object.keys(DEFAULT_OPTIONS).some((key) => !Object.hasOwn(current ?? {}, key));
 	const validated = validateConfig({ ...DEFAULT_OPTIONS, ...current as RoutingConfig });
-	if (missingDefaults || hadPresetOutputLimits || hadLegacyRetrySetting || hadLegacyMaxPreset) atomicWriteJson(configPath, validated.config);
+	if (missingDefaults || hadPresetOutputLimits || hadLegacyRetrySetting || hadLegacyDelegationSetting || hadLegacyMaxPreset) atomicWriteJson(configPath, validated.config);
 	return { config: validated.config, warnings: validated.warnings, path: configPath };
 }
 
 export function isPathInside(base: string, candidate: string): boolean {
 	const relative = path.relative(base, candidate);
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+	return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 export function resolveTaskCwd(baseCwd: string, requested?: string): string {
@@ -111,8 +103,8 @@ export function validateTask(task: WorkerTask, baseCwd: string): string[] {
 	const errors: string[] = [];
 	if (!MODES.includes(task.mode)) errors.push(`无效 mode: ${String(task.mode)}`);
 	if (!task.objective || !task.objective.trim()) errors.push("objective 不能为空");
-	if (task.preset && !PRESETS.includes(task.preset)) errors.push(`无效 preset: ${String(task.preset)}`);
-	if (task.sessionMode !== undefined && !SESSION_MODES.includes(task.sessionMode)) errors.push(`无效 sessionMode: ${String(task.sessionMode)}`);
+	if (!PRESETS.includes(task.preset)) errors.push(`无效 preset: ${String(task.preset)}`);
+	if (!SESSION_MODES.includes(task.sessionMode)) errors.push(`无效 sessionMode: ${String(task.sessionMode)}`);
 	if (WRITE_MODES.has(task.mode) && (!task.allowedPaths || task.allowedPaths.length === 0)) errors.push(`${task.mode} 必须提供非空 allowedPaths`);
 	for (const file of task.relevantFiles ?? []) {
 		if (!file.trim()) errors.push("relevantFiles 不能包含空路径");
@@ -148,17 +140,6 @@ export function validateTask(task: WorkerTask, baseCwd: string): string[] {
 	return errors;
 }
 
-export function inferPreset(task: WorkerTask): { preset: ResolvedPreset; reasons: string[] } {
-	if (task.preset && !PRESETS.includes(task.preset)) throw new Error(`无效 preset: ${String(task.preset)}`);
-	if (task.preset && task.preset !== "auto") return { preset: task.preset, reasons: [`任务显式指定 ${task.preset}`] };
-	const text = [task.objective, task.context, ...(task.acceptanceCriteria ?? [])].filter(Boolean).join(" ").toLowerCase();
-	const deep = /(跨模块|跨服务|跨语言|并发|异步状态|缓存一致性|网络重试|资源生命周期|数据同步|根因不明|架构|cross.module|cross.service|concurren|async state|cache consistency|retry|resource lifecycle|architecture)/i.test(text);
-	if (deep || (task.relevantFiles?.length ?? 0) >= 6) return { preset: "deep", reasons: [deep ? "包含复杂跨模块或状态一致性约束" : "相关文件范围较大"] };
-	const fast = /(查找|搜索|文案|css|类型错误|运行已有测试|机械修改|find|locate|copy change|type error|existing test)/i.test(text);
-	if (fast && (task.relevantFiles?.length ?? 0) <= 2) return { preset: "fast", reasons: ["目标明确、局部且易验证"] };
-	return { preset: "normal", reasons: ["普通开发任务，使用 Normal"] };
-}
-
 export function findConfiguredModel(ctx: ExtensionContext, modelId: string): Model<any> | undefined {
 	const parsed = splitModelId(modelId);
 	if (!parsed) return undefined;
@@ -166,8 +147,8 @@ export function findConfiguredModel(ctx: ExtensionContext, modelId: string): Mod
 }
 
 export function resolveRoute(task: WorkerTask, config: RoutingConfig, ctx: ExtensionContext): Route {
-	const inferred = inferPreset(task);
-	const preset = inferred.preset;
+	const preset = task.preset;
+	if (!PRESETS.includes(preset)) throw new Error(`无效 preset: ${String(preset)}`);
 	const setting = config[preset];
 	const thinking = setting.thinking;
 	const model = findConfiguredModel(ctx, setting.model);
@@ -175,11 +156,11 @@ export function resolveRoute(task: WorkerTask, config: RoutingConfig, ctx: Exten
 	const levels = supportedThinking(model);
 	if (!levels.includes(thinking)) throw new Error(`${setting.model} 不支持 thinking ${thinking}；当前最高为 ${levels.at(-1)}`);
 	return {
-		requestedPreset: task.preset ?? "auto",
+		requestedPreset: preset,
 		resolvedPreset: preset,
 		modelId: setting.model,
 		provider: model.provider,
 		thinking,
-		routeReason: inferred.reasons,
+		routeReason: [`任务显式指定 ${preset}`],
 	};
 }

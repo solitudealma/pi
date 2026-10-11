@@ -1,12 +1,22 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { resolveTaskCwd, WRITE_MODES } from "./config.ts";
+import { isPathInside, resolveTaskCwd, WRITE_MODES } from "./config.ts";
 import type { CommandResult, WorkerTask, WorkspaceSnapshot } from "./types.ts";
 
 export const DEFAULT_GIT_COMMAND_TIMEOUT_MS = 30_000;
 export const GIT_COMMAND_KILL_GRACE_MS = 1_000;
+
+// Auxiliary commands also use detached groups. Retain an exit fallback across
+// extension reloads, without tying commands from one session to another owner.
+const commandsKey = Symbol.for("pi.worker.commandChildren.v1");
+const commandGlobals = globalThis as typeof globalThis & { [commandsKey]?: Set<ChildProcess> };
+if (!commandGlobals[commandsKey]) {
+	const children = commandGlobals[commandsKey] = new Set<ChildProcess>();
+	process.once("exit", () => { for (const child of children) killProcessTree(child, "SIGKILL"); });
+}
+const commandChildren = commandGlobals[commandsKey];
 
 export interface RunCommandOptions {
 	maxBytes?: number;
@@ -68,11 +78,6 @@ export function canonicalizePotentialPath(filePath: string): string | null {
 	}
 }
 
-function isSameOrAncestor(ancestor: string, candidate: string): boolean {
-	const relative = path.relative(ancestor, candidate);
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
 /**
  * Convert allowedPaths to a conservative workspace-coordinate boundary.
  * A root-level or unsupported glob is deliberately unknown and conflicts with every writer.
@@ -84,7 +89,7 @@ export function declaredWriteBoundary(task: WorkerTask, baseCwd: string): WriteB
 	catch { return { unknown: true, ranges: [] }; }
 	const ranges: WriteBoundary["ranges"] = [];
 	for (const rawPattern of task.allowedPaths) {
-		const pattern = rawPattern.trim().replaceAll("\\", "/").replace(/^\.\/+/, "").replace(/\/+$/, "") || ".";
+		const pattern = rawPattern.replaceAll("\\", "/").replace(/^\.\/+/, "").replace(/\/+$/, "") || ".";
 		// globToRegExp only has defined semantics for * and ?. Treat other common
 		// glob syntax as unknown rather than claiming two tasks are independent.
 		if (/[\[\]{}]/.test(pattern)) return { unknown: true, ranges: [] };
@@ -110,7 +115,7 @@ function rangesOverlap(left: WriteBoundary["ranges"][number], right: WriteBounda
 	// Scheduling is deliberately stricter than exact guard matching: changing an
 	// ancestor node can affect a declared descendant even when the literal path
 	// itself does not grant write access to the descendant.
-	return isSameOrAncestor(left.root, right.root) || isSameOrAncestor(right.root, left.root);
+	return isPathInside(left.root, right.root) || isPathInside(right.root, left.root);
 }
 
 /** Cross-batch tasks may have different session cwd snapshots. */
@@ -166,39 +171,102 @@ export function attributeChangedFiles(
 	};
 }
 
+export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+	if (!child.pid) return;
+	try {
+		if (process.platform !== "win32") process.kill(-child.pid, signal);
+		else child.kill(signal);
+	} catch {
+		try { child.kill(signal); } catch { /* already exited */ }
+	}
+}
+
+/** false means no runnable members; unknown must retain the original kill deadline. */
+export function processGroupActive(pid: number): boolean | undefined {
+	try { process.kill(-pid, 0); }
+	catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? false : undefined; }
+	if (process.platform !== "linux") return undefined;
+	// kill(0) also sees orphan zombies. They cannot execute and may never be reaped
+	// by a container's PID 1, so do not wait for them indefinitely.
+	try {
+		let sawZombie = false;
+		for (const entry of fs.readdirSync("/proc")) {
+			if (!/^\d+$/.test(entry)) continue;
+			let stat: string;
+			try { stat = fs.readFileSync(`/proc/${entry}/stat`, "utf8"); }
+			catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+				return undefined;
+			}
+			const end = stat.lastIndexOf(") ");
+			const fields = stat.slice(end + 2).split(" ");
+			if (end < 0 || !/^\d+$/.test(fields[2] ?? "")) return undefined;
+			if (Number(fields[2]) !== pid) continue;
+			if (!["Z", "X"].includes(fields[0])) return true;
+			sawZombie = true;
+		}
+		// A group seen by kill(0) but absent from this scan is not confirmed empty.
+		return sawZombie ? false : undefined;
+	} catch { return undefined; }
+}
+
 export async function runCommand(command: string, args: string[], cwd: string, options: RunCommandOptions = {}): Promise<CommandResult> {
 	const maxBytes = Math.max(1, options.maxBytes ?? 4 * 1024 * 1024);
 	const timeoutMs = Math.max(1, options.timeoutMs ?? DEFAULT_GIT_COMMAND_TIMEOUT_MS);
 	throwIfAborted(options.signal, `命令 ${command} `);
 	return await new Promise((resolve, reject) => {
-		const child = spawn(command, args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(command, args, { cwd, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+		commandChildren.add(child);
 		const stdout: Buffer[] = [];
 		const stderr: Buffer[] = [];
 		let stdoutBytes = 0;
 		let stderrBytes = 0;
 		let settled = false;
+		let terminating = false;
+		let terminationError: Error | undefined;
+		let closedCode: number | undefined;
 		let killTimer: NodeJS.Timeout | undefined;
+		let forceTimer: NodeJS.Timeout | undefined;
+		let groupTimer: NodeJS.Timeout | undefined;
 		let timeout: NodeJS.Timeout | undefined;
-		const cleanup = () => {
-			if (timeout) clearTimeout(timeout);
-			options.signal?.removeEventListener("abort", abortHandler);
-		};
-		const fail = (error: Error) => {
+		const finish = () => {
 			if (settled) return;
 			settled = true;
-			cleanup();
-			reject(error);
+			clearTimeout(timeout);
+			clearTimeout(killTimer);
+			clearTimeout(forceTimer);
+			clearTimeout(groupTimer);
+			options.signal?.removeEventListener("abort", abortHandler);
+			if (closedCode !== undefined || !child.pid) commandChildren.delete(child);
+			if (terminationError) reject(terminationError);
+			else resolve({ code: closedCode ?? 1, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) });
 		};
-		const terminate = (error: Error) => {
+		const checkClosedGroup = () => {
+			if (settled || closedCode === undefined) return;
+			if (process.platform === "win32" || !child.pid || processGroupActive(child.pid) === false) { finish(); return; }
+			groupTimer = setTimeout(checkClosedGroup, 100);
+		};
+		const terminate = (error?: Error) => {
 			if (settled) return;
-			try { child.kill("SIGTERM"); } catch { /* process already exited */ }
+			terminationError ??= error;
+			if (terminating) return;
+			terminating = true;
+			killProcessTree(child, "SIGTERM");
 			killTimer = setTimeout(() => {
-				try { child.kill("SIGKILL"); } catch { /* process already exited */ }
+				killProcessTree(child, "SIGKILL");
+				forceTimer = setTimeout(() => {
+					terminationError = new Error(`${terminationError?.message ?? `命令 ${command} 清理失败`} [cleanup=FORCE_SETTLE]`);
+					child.stdout.destroy();
+					child.stderr.destroy();
+					child.unref();
+					finish();
+				}, GIT_COMMAND_KILL_GRACE_MS);
 			}, GIT_COMMAND_KILL_GRACE_MS);
-			killTimer.unref();
-			fail(error);
 		};
 		const abortHandler = () => terminate(new Error(`命令 ${command} 已取消`));
+		const reapDescendants = () => {
+			if (!settled && !terminating && process.platform !== "win32" && child.pid && processGroupActive(child.pid) !== false) terminate();
+		};
 		child.stdout.on("data", (chunk: Buffer) => {
 			const length = Math.min(chunk.length, Math.max(0, maxBytes - stdoutBytes));
 			if (length > 0) stdout.push(chunk.subarray(0, length));
@@ -209,20 +277,19 @@ export async function runCommand(command: string, args: string[], cwd: string, o
 			if (length > 0) stderr.push(chunk.subarray(0, length));
 			stderrBytes += length;
 		});
-		(child as any).on("error", (error: Error) => {
-			if (killTimer) clearTimeout(killTimer);
-			fail(error);
+		child.on("error", (error: Error) => {
+			if (child.pid) terminate(error);
+			else { terminationError = error; finish(); }
 		});
-		(child as any).on("close", (code: number | null) => {
-			if (killTimer) clearTimeout(killTimer);
-			if (settled) return;
-			settled = true;
-			cleanup();
-			resolve({ code: code ?? 1, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) });
+		child.on("exit", reapDescendants);
+		child.on("close", (code: number | null) => {
+			if (settled) { commandChildren.delete(child); return; }
+			closedCode = code ?? 1;
+			reapDescendants();
+			checkClosedGroup();
 		});
 		options.signal?.addEventListener("abort", abortHandler, { once: true });
 		timeout = setTimeout(() => terminate(new Error(`命令 ${command} 超时（${timeoutMs}ms）`)), timeoutMs);
-		timeout.unref();
 		if (options.signal?.aborted) abortHandler();
 	});
 }
@@ -237,8 +304,13 @@ export async function gitChangedPaths(gitRoot: string, signal?: AbortSignal): Pr
 		["diff", "--cached", "--name-only", "-z"],
 		["ls-files", "--others", "--exclude-standard", "-z"],
 	];
-	const results = await Promise.all(commands.map((args) => runCommand("git", args, gitRoot, { signal })));
-	return new Set(results.flatMap((result) => nulPaths(result.stdout)));
+	// Do not release the task while a sibling command is still cleaning up.
+	const results = await Promise.allSettled(commands.map((args) => runCommand("git", args, gitRoot, { signal })));
+	return new Set(results.flatMap((result, index) => {
+		if (result.status === "rejected") throw result.reason;
+		if (result.value.code !== 0) throw new Error(`git ${commands[index].join(" ")} 失败（${result.value.code}）：${result.value.stderr.toString("utf8").slice(-2048)}`);
+		return nulPaths(result.value.stdout);
+	}));
 }
 
 export function fileHash(filePath: string): string | null {

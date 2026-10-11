@@ -9,7 +9,7 @@ import type { WorkerTask } from "./types.ts";
 const contract = (prompt: string) => JSON.parse(prompt.split("\n")[1]);
 
 test("minimal task prompts omit empty context and host-owned route metadata", () => {
-	const prompt = buildTaskPrompt({ mode: "review", objective: "  review output  ", relevantFiles: [], context: "" }, null);
+	const prompt = buildTaskPrompt({ mode: "review", preset: "normal", sessionMode: "fork", objective: "  review output  ", relevantFiles: [], context: "" }, null);
 	assert.deepEqual(contract(prompt), { mode: "review", objective: "review output", sessionMode: "fork", allowedPaths: [] });
 	assert.ok(Buffer.byteLength(prompt) <= 750, "bound repeated task boilerplate");
 	assert.match(prompt, /2-4 条具体结论/);
@@ -55,12 +55,18 @@ test("always-loaded tool metadata and worker system prompt stay within compact b
 	}
 });
 
-test("dispatch instructions require autonomous per-task session selection", () => {
+test("dispatch instructions preserve session, authority and routing guidance within budget", () => {
 	assert.match(TOOL_DESCRIPTION, /Choose each task's sessionMode yourself/);
-	assert.match(TOOL_DESCRIPTION, /fork by default; use new only when little context handoff is needed/);
+	assert.match(TOOL_DESCRIPTION, /prefer fork; use new only when little context handoff is needed/);
 	assert.match(TOOL_DESCRIPTION, /do not ask the user/);
 	const skill = fs.readFileSync(new URL("./SKILL.md", import.meta.url), "utf8");
 	assert.ok(Buffer.byteLength(skill) <= 5000);
-	assert.match(skill, /显式填写 `sessionMode`/);
-	assert.match(skill, /省略时默认 fork/);
+	assert.match(TOOL_DESCRIPTION, /requires explicit preset and sessionMode/);
+	assert.match(skill, /`sessionMode` 和 `preset` 均必填/);
+	assert.doesNotMatch(skill, /thinking|worker-settings\.json|思考强度/i);
+	assert.doesNotMatch(skill, /manual|automaticDelegationEnabled/);
+	assert.deepEqual(Object.keys(InputSchema.properties).sort(), ["batchId", "cancel", "tasks"]);
+	assert.match(skill, /implement\/test\/fix 均要求非空 `allowedPaths`/);
+	assert.match(skill, /Worker 不自动加载 skills 或项目上下文文件/);
+	assert.match(skill, /不默认追加 Review/);
 });

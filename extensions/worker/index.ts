@@ -16,15 +16,15 @@ import { cloneUiDetails, compactWorkerResult, emptyWorkerUsage, renderWorkerDeta
 import { WorkerRuntime, type Batch } from "./runtime.ts";
 import { present, emptyWorkerComponent, workerBranchSnapshots, WORKER_SNAPSHOT_ENTRY, WorkerRenderRefresh } from "./presentation.ts";
 
-export const TOOL_DESCRIPTION = `Autonomously delegate bounded, verifiable tasks: fast for clear local work, normal for ordinary work, deep for difficult work, or auto. Read worker-orchestration for non-trivial delegation. Choose each task's sessionMode yourself: fork by default; use new only when little context handoff is needed; do not ask the user. Workers cannot delegate. Handle failures without automatic retries; verify diffs and acceptance evidence yourself.
-ONE unfinished batch per session; parallel tasks go in ONE tasks array. Start: exactly one of task/tasks (optional manual). Continue: {batchId}. Cancel: {batchId,cancel:true}. Do not mix modes. A second start returns activeBatchId; finish or cancel it first.
+export const TOOL_DESCRIPTION = `Autonomously delegate bounded, verifiable tasks: fast for clear local work, normal for ordinary work, deep for difficult work. Every task requires explicit preset and sessionMode. Read worker-orchestration for non-trivial delegation. Choose each task's sessionMode yourself: prefer fork; use new only when little context handoff is needed; do not ask the user. Workers cannot delegate. Handle failures without automatic retries; verify diffs and acceptance evidence yourself.
+ONE unfinished batch per session; parallel tasks go in ONE tasks array. Start: tasks array, even for one task. Continue: {batchId}. Cancel: {batchId,cancel:true}. Do not mix modes. A second start returns activeBatchId; finish or cancel it first.
 Start/continue waits for completion; no polling. Finish or cancel all batches before ending your turn. Do not edit locked paths. Missing information/authorization returns blocked; handle in the main agent, then create a new bounded task if needed. Never infer authorization. Deadlines are fixed. Cancel/abort of an active call waits for cleanup and lock release; abort after return has no effect. Scope changes require cancellation, cleanup and a new task.`;
 
 export const TaskSchema = Type.Object({
 	mode: StringEnum(MODES),
 	objective: Type.String({ minLength: 1 }),
-	preset: Type.Optional(StringEnum(PRESETS)),
-	sessionMode: Type.Optional(StringEnum(SESSION_MODES, { description: "Default fork: snapshot current branch at batch start. Use new only for minimal context handoff." })),
+	preset: StringEnum(PRESETS),
+	sessionMode: StringEnum(SESSION_MODES, { description: "Choose explicitly: fork snapshots the current branch at batch start; new is for minimal context handoff." }),
 	context: Type.Optional(Type.String()),
 	relevantFiles: Type.Optional(Type.Array(Type.String({ description: "Read hints, including outside cwd; no write permission." }))),
 	allowedPaths: Type.Optional(Type.Array(Type.String({ description: "Write modes require scope relative to cwd: exact/new files or globs; directory children use dir/**, not dir or dir/. Guards edit/write only, not a sandbox." }))),
@@ -36,9 +36,7 @@ export const TaskSchema = Type.Object({
 }, { additionalProperties: false });
 
 export const InputSchema = Type.Object({
-	task: Type.Optional(TaskSchema),
 	tasks: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: 12 })),
-	manual: Type.Optional(Type.Boolean()),
 	batchId: Type.Optional(Type.String({ minLength: 1 })),
 	cancel: Type.Optional(Type.Literal(true)),
 }, { additionalProperties: false });
@@ -48,9 +46,9 @@ export function validateWorkerInput(input: unknown): asserts input is WorkerTool
 	if (!Check(InputSchema, input)) throw new Error("worker 参数错误：字段、类型或数量无效（不接受未知字段）");
 	const value = input as WorkerToolInput;
 	if (value.batchId !== undefined) {
-		if (!value.batchId.trim() || "task" in value || "tasks" in value || "manual" in value) throw new Error("worker 参数错误：batchId 不能与 task/tasks/manual 混用");
+		if (!value.batchId.trim() || "tasks" in value) throw new Error("worker 参数错误：batchId 不能与 tasks 混用");
 	} else {
-		if (("task" in value) === ("tasks" in value)) throw new Error("worker 参数错误：task 和 tasks 必须二选一");
+		if (!value.tasks) throw new Error("worker 参数错误：启动必须提供 tasks 数组");
 		if ("cancel" in value) throw new Error("worker 参数错误：cancel 必须提供 batchId");
 	}
 }
@@ -73,7 +71,7 @@ export function batchUiSnapshot(batch: Batch): WorkerUiDetails {
 /** Keep IDs/control state outside result compression so truncation cannot strand a batch. */
 export function batchResponse(batch: Batch) {
 	const results = batch.tasks.map((task) => task.result ?? { status: task.state });
-	const resultPayload = batch.single ? results[0] : { status: results.every((item) => item.status === "completed") ? "completed" : "partial", results };
+	const resultPayload = { status: results.every((item) => item.status === "completed") ? "completed" : "partial", results };
 	const compressed = serializePayload(resultPayload, batch.maxOutputBytes);
 	const payload = {
 		batchId: batch.id,
@@ -205,7 +203,7 @@ export default function workerExtension(pi: ExtensionAPI, services = { executeTa
 			}
 			const blocked = activeStartError(session.runtime);
 			if (blocked) return blocked;
-			const tasks = input.task ? [input.task] : input.tasks!;
+			const tasks = input.tasks!;
 			const taskErrors = tasks.map((task) => validateTask(task, ctx.cwd));
 			if (taskErrors.some((errors) => errors.length)) {
 				const details = taskErrors.map((errors, index) => ({ index, errors }));
@@ -216,15 +214,12 @@ export default function workerExtension(pi: ExtensionAPI, services = { executeTa
 			catch (error) {
 				return respond(JSON.stringify({ status: "blocked", summary: [error instanceof Error ? error.message : String(error)] }, null, 2), { status: "blocked" });
 			}
-			if (!loaded.config.automaticDelegationEnabled && !input.manual) {
-				return respond(JSON.stringify({ status: "blocked", summary: ["自动委派已在 worker-settings.json 中关闭；手动调用请设置 manual: true"] }, null, 2), { status: "blocked" });
-			}
 			if (signal?.aborted || stopped) return respond("Worker 已取消或会话已关闭", { status: "failed" });
 			const owner = session.runtime; // Session replacement must not redirect old callbacks.
 			let toolActive = true;
 			const uiDetails: WorkerUiDetails = {
 				kind: "worker-ui", originToolCallId: toolCallId, startedAt: Date.now(), limit: loaded.config.maxConcurrentWorkers, total: tasks.length, completed: 0,
-				tasks: tasks.map((task, index) => ({ index, mode: task.mode, objective: task.objective, status: "queued", requestedPreset: task.preset ?? "auto", sessionMode: task.sessionMode ?? "fork", attempt: 0, phase: "等待执行", activities: [], toolCalls: 0, usage: emptyWorkerUsage() })),
+				tasks: tasks.map((task, index) => ({ index, mode: task.mode, objective: task.objective, status: "queued", requestedPreset: task.preset, sessionMode: task.sessionMode, attempt: 0, phase: "等待执行", activities: [], toolCalls: 0, usage: emptyWorkerUsage() })),
 			};
 			const emitTaskUsage = (task: WorkerUiDetails["tasks"][number]) => {
 				const snapshot: WorkerUsageSnapshot = { taskId: `${toolCallId}:${task.index}`, input: task.usage.input, output: task.usage.output };
@@ -236,13 +231,13 @@ export default function workerExtension(pi: ExtensionAPI, services = { executeTa
 			if (blockedAtAdmission) return blockedAtAdmission;
 			let sessionSnapshot: WorkerSessionSnapshot | undefined;
 			try {
-				if (tasks.some((task) => task.sessionMode !== "new")) sessionSnapshot = captureWorkerSession(ctx.sessionManager);
+				if (tasks.some((task) => task.sessionMode === "fork")) sessionSnapshot = captureWorkerSession(ctx.sessionManager);
 			} catch (error) {
 				return respond(JSON.stringify({ status: "blocked", summary: [`Worker 会话快照失败：${error instanceof Error ? error.message : String(error)}`] }), { status: "blocked" });
 			}
 			const batch = owner.start({
 				limit: loaded.config.maxConcurrentWorkers, timeoutMs: loaded.config.defaultTimeoutMs,
-				maxOutputBytes: loaded.config.maxOutputBytes, single: !!input.task, ui: uiDetails,
+				maxOutputBytes: loaded.config.maxOutputBytes, ui: uiDetails,
 				execute: async (running) => {
 					const uiTask = uiDetails.tasks[running.index];
 					uiTask.startedAt = Date.now();
@@ -251,7 +246,7 @@ export default function workerExtension(pi: ExtensionAPI, services = { executeTa
 						emitTaskUsage(uiTask);
 						owner.changed();
 						if (toolActive) present(() => onUpdate?.(respond(`${running.task.mode} ${uiTask.phase}`, batchUiSnapshot(running.batch))));
-					}, () => running.overlappedWriter, true, invocationSession.processes, running.task.sessionMode !== "new" ? sessionSnapshot : undefined);
+					}, () => running.overlappedWriter, true, invocationSession.processes, running.task.sessionMode === "fork" ? sessionSnapshot : undefined);
 					const sanitized = sanitizeStructuredValue(item) as Record<string, any>;
 					const compact = compactWorkerResult(sanitized);
 					compact.observed_changed_files = Array.isArray(sanitized.observed_changed_files) ? sanitized.observed_changed_files : [];
@@ -279,8 +274,8 @@ export default function workerExtension(pi: ExtensionAPI, services = { executeTa
 		},
 		renderCall(args, theme) {
 			// Empty partial args and ALL continuations have no title, shell, padding or spinner.
-			if (!args.task && !Array.isArray(args.tasks)) return emptyWorkerComponent();
-			const count = args.task ? 1 : Array.isArray(args.tasks) ? args.tasks.length : 0;
+			if (!Array.isArray(args.tasks)) return emptyWorkerComponent();
+			const count = args.tasks.length;
 			const title = count > 1 ? `Workers ×${count}` : "Worker";
 			return new Text(theme.fg("toolTitle", theme.bold(title)), 0, 0);
 		},

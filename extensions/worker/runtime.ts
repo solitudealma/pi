@@ -20,7 +20,6 @@ export interface Batch {
 	limit: number;
 	timeoutMs: number;
 	maxOutputBytes: number;
-	single: boolean;
 	ui: WorkerUiDetails;
 	tasks: RuntimeTask[];
 	finished: boolean;

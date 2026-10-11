@@ -9,7 +9,7 @@ This is my personal [Pi Coding Agent](https://pi.dev) configuration: custom exte
 - Custom TUI: interface, dark theme, and `Ctrl+Y` session resume; the footer shows context usage, model, Thinking, Codex Fast switches, and remaining subscription quota/reset countdown.
 - `ask_question` supports single-choice, multiple-choice, and multi-question confirmations; concurrent questionnaires are queued to avoid replacing each other. `/commit` generates a Conventional Commit message and commits (staging all changes).
 - `/codex-fast` separately configures Fast / Ultrafast request tiers; Chinese thinking translation and automatic Chinese session naming are enabled by default and can be disabled in their configuration.
-- [Worker](#worker) assists with scoped tasks in separate Pi subprocesses. Automatic routing has only three tiers: Fast, Normal, and Deep; Thinking strength is configured independently. Path checks are not a security sandbox; inspect the resulting changes.
+- [Worker](#worker) assists with scoped tasks in separate Pi subprocesses. The main model explicitly selects one of three tiers: Fast, Normal, and Deep; Thinking strength is configured independently. Path checks are not a security sandbox; inspect the resulting changes.
 - [SoL-Pi](#context-management-sol-pi) archives large tool results and provides online context compaction. Tool-result filtering reduces exposure to common secrets but does not guarantee redaction.
 
 ## Local extension inventory
@@ -29,7 +29,7 @@ Each row corresponds to current source under `extensions/`, excluding `node_modu
 | [telegram](extensions/telegram/index.ts) | Send run replies and some question notifications to a target chat | Automatic event notifications, not a user command; no remote control | Environment variables `PI_TG_TOKEN`, `PI_TG_CHAT`; sends nothing if either is missing; no polling; depends on `node-telegram-bot-api` |
 | [thinking-translation](extensions/thinking-translation/index.ts) | Add Chinese display translations to short Thinking without changing source sessions or model context | `/thinking_translation` toggle; automatically triggered by live streaming | `thinking-translation-settings.json`: `enabled`, `model`, `maxThinkingLength`; requests always use minimal reasoning; local cache at `~/.pi/thinking-translations/` |
 | [ui](extensions/ui/index.ts) | Custom header, editor, footer, tool cards, and main-agent + Worker progress/usage | Automatic TUI rendering, not a user command | No separate configuration; footer reads `codex-fast.json`; theme/display settings in `settings.json`, shortcuts in `keybindings.json` |
-| [worker](extensions/worker/index.ts) | Bounded subprocess tasks, parallel scheduling, and progress cards | Agent tool `worker`; `/worker_settings` | `worker-settings.json`: required three-tier models/Thinking, concurrency, automatic delegation, timeout, and output limit; in subprocesses, this entry installs only the write guard, not nested delegation |
+| [worker](extensions/worker/index.ts) | Bounded subprocess tasks, parallel scheduling, and progress cards | Agent tool `worker`; `/worker_settings` | `worker-settings.json`: required three-tier models/Thinking, concurrency, timeout, and output limit; in subprocesses, this entry installs only the write guard, not nested delegation |
 
 The old local `context`, `usage`, and `fast` extensions have been removed; their `/context`, `/usage`, and `/fast` commands are no longer provided by these extensions. Context usage appears in the footer; Fast settings use `/codex-fast`. `rolling-compact` and its configuration have been removed, and `/roll-compact` is no longer provided; context management uses SoL-Pi again. External packages are not part of this local inventory.
 
@@ -95,9 +95,9 @@ These are source-code defaults, not copied local model or user settings; local c
 
 ## Worker
 
-`worker` delegates bounded, independently verifiable subtasks to separate Pi subprocesses. The main model defaults to `fork` (an isolated snapshot of the current active branch), including when the mode is omitted, and uses `new` (fresh history) only when little context handoff is needed. Child sessions are temporary and do not automatically load Skills or Context Files, and may not create or call other Workers. The main agent decomposes the work, handles blockers, inspects the actual diff, verifies it, and makes the final acceptance decision.
+`worker` delegates bounded, independently verifiable subtasks to separate Pi subprocesses. Every task requires explicit `sessionMode` and `preset`. The main model prefers `fork` (an isolated snapshot of the current active branch) and uses `new` (fresh history) only when little context handoff is needed. Child sessions are temporary and do not automatically load Skills or Context Files, and may not create or call other Workers. The main agent decomposes the work, handles blockers, inspects the actual diff, verifies it, and makes the final acceptance decision.
 
-Starting, continuing to wait, and cancelling all use the single `worker` tool. Each main session allows only one unfinished batch; put parallel tasks in the `tasks` array of a single call. Batch results retain input order and each task may complete, be blocked, or fail independently.
+Starting, continuing to wait, and cancelling all use the single `worker` tool. Each main session allows only one unfinished batch; always pass a `tasks` array, even for one task; put parallel work in a single call. Batch results retain input order and each task may complete, be blocked, or fail independently.
 
 The summary and `changed_files` report Worker claims and workspace snapshot information; they do not replace the main agent's inspection of the actual diff.
 
@@ -109,9 +109,9 @@ Five modes are supported: `scout` for read-only investigation, `implement` for i
 - **Normal**: routine work and the default when unsure between Fast and Deep.
 - **Deep**: difficult work such as cross-module changes, unknown root causes, or concurrent state; it is the highest task-complexity tier.
 
-`preset` accepts only `auto`, `fast`, `normal`, and `deep`; **there is no Max execution tier**. Thinking levels `high`, `xhigh`, and `max` are independent per-tier reasoning strengths, not extra routing tiers, and must be supported by the model.
+`preset` is required and accepts only `fast`, `normal`, and `deep`; **there is no auto or Max execution tier**, and no keyword or file-count inference. Thinking levels `off/minimal/low/medium/high/xhigh/max` are independent per-tier reasoning strengths, not extra routing tiers, and must be supported by the model.
 
-Models and Thinking for every tier are read from local `worker-settings.json`; `fast`, `normal`, and `deep` must each specify a valid model. Missing/unavailable models produce errors, never guessed routes or silent downgrades. Loading legacy configuration removes and persists the obsolete top-level `max` entry. General source defaults are concurrency 3, automatic delegation enabled, 15-minute task timeout, and 64 KiB output limit. `/worker_settings` interactively edits these settings and per-tier models/Thinking; choosing “Save and exit” applies them immediately to subsequent tasks. When automatic delegation is off, explicit starts require `manual: true`.
+Models and Thinking for every tier are read exactly from local `worker-settings.json`, without automatic conversion, upgrades or downgrades; `fast`, `normal`, and `deep` must each specify a valid model. Missing/unavailable models produce errors, never guessed routes or silent downgrades. Loading legacy configuration removes and persists the obsolete top-level `max` and `automaticDelegationEnabled` entries. Delegation is always supported, with no enable switch or `manual` parameter. General source defaults are concurrency 3, 15-minute task timeout, and 64 KiB output limit. `/worker_settings` interactively edits these settings and per-tier models/Thinking; choosing “Save and exit” applies them immediately to subsequent tasks.
 
 ### Blockers and user decisions
 

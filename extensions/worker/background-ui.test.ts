@@ -72,7 +72,7 @@ test("original Pi card receives progress until completion and continuations rema
 	await h.handlers.get("session_start")({}, h.ctx);
 	try {
 		const tool = h.tools.get("worker");
-		const args = { task: { mode: "scout", objective: "live task" } };
+		const args = { tasks: [{ mode: "scout", preset: "normal", sessionMode: "fork", objective: "live task" }] };
 		const Component = await piToolComponent();
 		const row = new Component("worker", "owner", args, {}, tool, { requestRender() {} }, process.cwd());
 		row.markExecutionStarted(); row.setArgsComplete();
@@ -163,7 +163,7 @@ test("installed Pi and complete UI patch stack frame only visible Worker rows li
 	try {
 		const makeRow = (name: string, id: string, args: any, definition: any) => new Component(name, id, args, {}, definition, { requestRender() {} }, process.cwd());
 		const workerTool = h.tools.get("worker");
-		const args = { task: { mode: "scout", objective: "宽度中文ABC" } };
+		const args = { tasks: [{ mode: "scout", preset: "normal", sessionMode: "fork", objective: "宽度中文ABC" }] };
 		const owner = makeRow("worker", "framed-owner", args, workerTool);
 		const ordinary = makeRow("ordinary", "normal", {}, {
 			renderCall: () => new Text(liveTheme.fg("toolTitle", liveTheme.bold("Ordinary")), 0, 0),
@@ -224,7 +224,7 @@ test("history reload merges only the selected branch snapshot and rejects stale 
 	await h.handlers.get("session_start")({}, h.ctx);
 	try {
 		const tool = h.tools.get("worker");
-		const args = { task: { mode: "scout", objective: "branch snapshot" } };
+		const args = { tasks: [{ mode: "scout", preset: "normal", sessionMode: "fork", objective: "branch snapshot" }] };
 		const result = await tool.execute("origin", args, undefined, undefined, h.ctx);
 		const batchId = result.details.batchId;
 		await h.handlers.get("session_start")({}, h.ctx);

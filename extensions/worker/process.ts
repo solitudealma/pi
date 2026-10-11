@@ -9,7 +9,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildTaskPrompt, workerPromptBody } from "./prompt.ts";
 import { resolveRoute, resolveTaskCwd } from "./config.ts";
 import { WORKER_ALLOWED_PATHS_ENV, WORKER_CWD_ENV, WORKER_FORBIDDEN_PATHS_ENV, WORKER_MODE_ENV } from "./guard.ts";
-import { attributeChangedFiles, changedSince, snapshotWorkspace } from "./security.ts";
+import { attributeChangedFiles, changedSince, killProcessTree, processGroupActive, snapshotWorkspace } from "./security.ts";
 import type { ChildProgress, ChildResult, Route, RoutingConfig, WorkerTask, WorkerUiActivity, WorkerUiActivityStatus, WorkerUiTask, WorkerUsage, WorkspaceSnapshot } from "./types";
 import { addWorkerUsage, appendUiActivity, createThinkingActivityRecorder, emptyWorkerUsage, estimateMessageTokens, messageUsage, summarizeToolArgs, summarizeToolResult, uiSnippet } from "./ui.ts";
 
@@ -54,45 +54,6 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 		return { command: currentScript, args };
 	}
 	return { command: "pi", args };
-}
-
-export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
-	if (!child.pid) return;
-	try {
-		if (process.platform !== "win32") process.kill(-child.pid, signal);
-		else child.kill(signal);
-	} catch {
-		try { child.kill(signal); } catch { /* already exited */ }
-	}
-}
-
-/** false means no runnable members; unknown must retain the original kill deadline. */
-function processGroupActive(pid: number): boolean | undefined {
-	try { process.kill(-pid, 0); }
-	catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? false : undefined; }
-	if (process.platform !== "linux") return undefined;
-	// kill(0) also sees orphan zombies. They cannot execute and may never be reaped
-	// by a container's PID 1, so do not wait for them indefinitely.
-	try {
-		let sawZombie = false;
-		for (const entry of fs.readdirSync("/proc")) {
-			if (!/^\d+$/.test(entry)) continue;
-			let stat: string;
-			try { stat = fs.readFileSync(`/proc/${entry}/stat`, "utf8"); }
-			catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-				return undefined;
-			}
-			const end = stat.lastIndexOf(") ");
-			const fields = stat.slice(end + 2).split(" ");
-			if (end < 0 || !/^\d+$/.test(fields[2] ?? "")) return undefined;
-			if (Number(fields[2]) !== pid) continue;
-			if (!["Z", "X"].includes(fields[0])) return true;
-			sawZombie = true;
-		}
-		// A group seen by kill(0) but absent from this scan is not confirmed empty.
-		return sawZombie ? false : undefined;
-	} catch { return undefined; }
 }
 
 function releaseSlot(owner: WorkerOwner): void {
@@ -254,6 +215,7 @@ export async function runPiWorker(
 			let timedOut = false;
 			let settled = false;
 			let terminating = false;
+			let cleaningDescendants = false;
 			let stdoutBytes = 0;
 			let forceKillTimer: NodeJS.Timeout | undefined;
 			let forceSettleTimer: NodeJS.Timeout | undefined;
@@ -308,14 +270,21 @@ export async function runPiWorker(
 				groupCheckTimer = setTimeout(checkClosedGroup, 100);
 				// Keep the cleanup alive even when the group leader closed all its pipes.
 			};
-			const terminate = (reason: "abort" | "timeout" | "output" | "owner_shutdown") => {
-				if (settled || terminating) return;
+			const terminate = (reason: "abort" | "timeout" | "output" | "owner_shutdown" | "cleanup") => {
+				if (settled || (terminating && !cleaningDescendants)) return;
+				const alreadyTerminating = terminating;
 				terminating = true;
-				const source = reason === "abort" ? terminationSource(signal) : reason;
-				diagnostic ??= { stage: "process", code: source, source, parentPid: process.pid, workerPid: child.pid, ownerId: owner.id };
-				aborted = (reason === "abort" && source !== "task_timeout") || reason === "owner_shutdown";
-				timedOut = reason === "timeout" || source === "task_timeout";
-				errorMessage ||= `Worker 已终止 [source=${source} parent=${process.pid} worker=${child.pid ?? "unknown"} owner=${owner.id}]`;
+				cleaningDescendants = reason === "cleanup";
+				if (!cleaningDescendants) {
+					const source = reason === "abort" ? terminationSource(signal) : reason;
+					diagnostic ??= { stage: "process", code: source, source, parentPid: process.pid, workerPid: child.pid, ownerId: owner.id };
+					aborted = (reason === "abort" && source !== "task_timeout") || reason === "owner_shutdown";
+					timedOut = reason === "timeout" || source === "task_timeout";
+					errorMessage ||= `Worker 已终止 [source=${source} parent=${process.pid} worker=${child.pid ?? "unknown"} owner=${owner.id}]`;
+				}
+				const terminatingPhase = () => setPhase(cleaningDescendants ? "清理子进程" : aborted ? "正在取消" : timedOut ? "正在终止超时任务" : "正在终止超限输出", cleaningDescendants ? "running" : "failed");
+				// A cancellation during normal cleanup changes the result, not its fixed grace.
+				if (alreadyTerminating) { terminatingPhase(); return; }
 				killProcessTree(child, "SIGTERM");
 				forceKillTimer = setTimeout(() => {
 					if (settled) return;
@@ -331,7 +300,7 @@ export async function runPiWorker(
 				}, WORKER_TERMINATE_GRACE_MS);
 				forceKillTimer.unref();
 				// Install cleanup before notifying presentation code (including reentrancy).
-				setPhase(aborted ? "正在取消" : timedOut ? "正在终止超时任务" : "正在终止超限输出", "failed");
+				terminatingPhase();
 			};
 			const abortHandler = () => terminate("abort");
 			owner.stops.set(child, () => terminate("owner_shutdown"));
@@ -433,6 +402,12 @@ export async function runPiWorker(
 				errorMessage ||= `Worker spawn failed [code=${diagnostic.code} parent=${process.pid} owner=${owner.id}]: ${error.message}`;
 				finish(1);
 			});
+			const reapDescendants = () => {
+				if (!settled && !terminating && process.platform !== "win32" && child.pid && processGroupActive(child.pid) !== false) terminate("cleanup");
+			};
+			// Descendants can hold inherited output pipes open after the leader exits,
+			// so waiting for "close" before starting cleanup would deadlock until timeout.
+			child.on("exit", reapDescendants);
 			(child as any).on("close", (code: number | null, exitSignal: NodeJS.Signals | null) => {
 				if (settled) { forgetChild(owner, child); return; }
 				closedCode = code ?? 1;
@@ -443,6 +418,7 @@ export async function runPiWorker(
 				if (stdoutBuffer.trim()) {
 					try { processEvent(JSON.parse(stdoutBuffer)); } catch { /* ignore trailing diagnostics */ }
 				}
+				reapDescendants();
 				if (terminating) checkClosedGroup();
 				else finish(closedCode);
 			});
@@ -475,8 +451,8 @@ export function isBlockedFailure(child: ChildResult): boolean {
 
 export function baseExecution(task: WorkerTask, route: Route | null, attempt: number, warnings: string[]) {
 	return {
-		session_mode: task.sessionMode ?? "fork",
-		requested_preset: task.preset ?? "auto",
+		session_mode: task.sessionMode,
+		requested_preset: task.preset,
 		resolved_preset: route?.resolvedPreset ?? null,
 		resolved_model_id: route?.modelId ?? null,
 		resolved_thinking: route?.thinking ?? null,
@@ -503,8 +479,8 @@ export async function executeTask(task: WorkerTask, config: RoutingConfig, warni
 	let stage = "route_or_contract";
 	report({ status: "running", phase: "解析模型路由" });
 	try {
-		if (task.sessionMode !== undefined && task.sessionMode !== "new" && task.sessionMode !== "fork") throw new Error(`无效 sessionMode: ${String(task.sessionMode)}`);
-		if (task.sessionMode !== "new" && !sessionSnapshot) {
+		if (task.sessionMode !== "new" && task.sessionMode !== "fork") throw new Error(`无效 sessionMode: ${String(task.sessionMode)}`);
+		if (task.sessionMode === "fork" && !sessionSnapshot) {
 			stage = "session_snapshot";
 			sessionSnapshot = captureWorkerSession(ctx.sessionManager);
 		}

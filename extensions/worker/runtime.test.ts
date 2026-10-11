@@ -65,7 +65,7 @@ test("later-started writers mark overlap on both active tasks, but readers do no
 		await until(() => batch.tasks[2].state === "running");
 		assert.ok(batch.tasks.every((item) => item.overlappedWriter));
 		first.resolve(); later.resolve(); await runtime.wait(batch.id);
-		const readers = start(runtime, [{ mode: "review", objective: "read" }, { mode: "scout", objective: "read" }], async () => completed);
+		const readers = start(runtime, [{ mode: "review", preset: "normal", sessionMode: "fork", objective: "read" }, { mode: "scout", preset: "normal", sessionMode: "fork", objective: "read" }], async () => completed);
 		await runtime.wait(readers.id);
 		assert.ok(readers.tasks.every((item) => !item.overlappedWriter));
 	} finally { first.resolve(); later.resolve(); await runtime.dispose(); }

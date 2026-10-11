@@ -1,39 +1,22 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { RESOLVED_PRESETS, atomicWriteJson, supportedThinking, validateConfig } from "./config.ts";
-import type { ResolvedPreset, RoutingConfig, Thinking } from "./types";
+import { PRESETS, THINKING_LEVELS, atomicWriteJson, supportedThinking, validateConfig } from "./config.ts";
+import type { WorkerPreset, RoutingConfig } from "./types";
 
-type MenuKey = ResolvedPreset | "maxConcurrentWorkers" | "automaticDelegationEnabled" | "defaultTimeoutMs" | "maxOutputBytes" | "save" | "cancel";
+type MenuKey = WorkerPreset | "maxConcurrentWorkers" | "defaultTimeoutMs" | "maxOutputBytes" | "save" | "cancel";
 
-type Choice<T> = { label: string; value: T };
-
-const THINKING_LEVELS = ["high", "xhigh", "max"] as const;
-const PRESET_LABELS: Record<ResolvedPreset, string> = {
+const PRESET_LABELS: Record<WorkerPreset, string> = {
 	fast: "Fast",
 	normal: "Normal",
 	deep: "Deep",
 };
 
-const enabledName = (value: boolean): string => value ? "开启" : "关闭";
 const formatDuration = (milliseconds: number): string => {
 	const seconds = milliseconds / 1_000;
 	return seconds >= 60 && seconds % 60 === 0 ? `${seconds / 60}m` : `${seconds}s`;
 };
 const formatOutput = (bytes: number): string => `${Math.round(bytes / 1_024)} KiB`;
 
-const chooseBoolean = async (ctx: ExtensionContext, title: string, current: boolean): Promise<boolean> => {
-	const choices: Choice<boolean>[] = [
-		{ label: "开启", value: true },
-		{ label: "关闭", value: false },
-	];
-	const options = choices.map((choice) => `${choice.value === current ? "●" : "○"} ${choice.label}`);
-	const selected = await ctx.ui.select(title, options);
-	return selected ? choices[options.indexOf(selected)]?.value ?? current : current;
-};
-
-const workerThinkingLevels = (model: ReturnType<ExtensionContext["modelRegistry"]["getAvailable"]>[number]): Thinking[] =>
-	supportedThinking(model).filter((level): level is Thinking => THINKING_LEVELS.includes(level as Thinking));
-
-const configurePreset = async (ctx: ExtensionContext, draft: RoutingConfig, preset: ResolvedPreset): Promise<void> => {
+const configurePreset = async (ctx: ExtensionContext, draft: RoutingConfig, preset: WorkerPreset): Promise<void> => {
 	while (true) {
 		const setting = draft[preset];
 		const items = [
@@ -48,10 +31,9 @@ const configurePreset = async (ctx: ExtensionContext, draft: RoutingConfig, pres
 
 		const available = ctx.modelRegistry.getAvailable();
 		if (key === "model") {
-			const compatible = available.filter((model) => workerThinkingLevels(model).includes("high"));
-			const modelIds = [...new Set(compatible.map((model) => `${model.provider}/${model.id}`))].sort((a, b) => a.localeCompare(b));
+			const modelIds = [...new Set(available.map((model) => `${model.provider}/${model.id}`))].sort((a, b) => a.localeCompare(b));
 			if (!modelIds.includes(setting.model)) modelIds.unshift(setting.model);
-			const availableIds = new Set(compatible.map((model) => `${model.provider}/${model.id}`));
+			const availableIds = new Set(available.map((model) => `${model.provider}/${model.id}`));
 			const options = modelIds.map((modelId) => [
 				modelId === setting.model ? "●" : "○",
 				modelId,
@@ -62,17 +44,15 @@ const configurePreset = async (ctx: ExtensionContext, draft: RoutingConfig, pres
 			const modelId = modelIds[options.indexOf(chosen)];
 			if (!modelId) continue;
 			setting.model = modelId;
-			const model = compatible.find((item) => `${item.provider}/${item.id}` === modelId);
+			const model = available.find((item) => `${item.provider}/${item.id}` === modelId);
 			if (model) {
-				const levels = workerThinkingLevels(model);
-				if (!levels.includes(setting.thinking)) {
-					setting.thinking = levels.at(-1) ?? "high";
-					ctx.ui.notify(`Thinking 已调整为 ${setting.thinking}`, "info");
+				if (!supportedThinking(model).includes(setting.thinking)) {
+					ctx.ui.notify(`模型不支持当前 Thinking ${setting.thinking}；已保留原值，请显式选择支持的等级`, "warning");
 				}
 			}
 		} else if (key === "thinking") {
 			const model = available.find((item) => `${item.provider}/${item.id}` === setting.model);
-			const levels = model ? workerThinkingLevels(model) : [...THINKING_LEVELS];
+			const levels = model ? supportedThinking(model) : [...THINKING_LEVELS];
 			if (!levels.length) {
 				ctx.ui.notify("当前模型不支持 Worker 所需的 Thinking", "warning");
 				continue;
@@ -103,12 +83,11 @@ const inputInteger = async (
 };
 
 const menuItems = (config: RoutingConfig): Array<{ key: MenuKey; label: string }> => [
-	...RESOLVED_PRESETS.map((preset) => ({
+	...PRESETS.map((preset) => ({
 		key: preset,
 		label: `${PRESET_LABELS[preset]} · ${config[preset].model} · ${config[preset].thinking}`,
 	})),
 	{ key: "maxConcurrentWorkers", label: `并发上限 · ${config.maxConcurrentWorkers}` },
-	{ key: "automaticDelegationEnabled", label: `自动委派 · ${enabledName(config.automaticDelegationEnabled)}` },
 	{ key: "defaultTimeoutMs", label: `默认超时 · ${formatDuration(config.defaultTimeoutMs)}` },
 	{ key: "maxOutputBytes", label: `最大输出 · ${formatOutput(config.maxOutputBytes)}` },
 	{ key: "save", label: "保存并退出" },
@@ -117,11 +96,11 @@ const menuItems = (config: RoutingConfig): Array<{ key: MenuKey; label: string }
 
 const validateModels = (ctx: ExtensionContext, config: RoutingConfig): string | undefined => {
 	const available = ctx.modelRegistry.getAvailable();
-	for (const preset of RESOLVED_PRESETS) {
+	for (const preset of PRESETS) {
 		const setting = config[preset];
 		const model = available.find((item) => `${item.provider}/${item.id}` === setting.model);
 		if (!model) return `${PRESET_LABELS[preset]} 模型当前不可用：${setting.model}`;
-		if (!workerThinkingLevels(model).includes(setting.thinking)) {
+		if (!supportedThinking(model).includes(setting.thinking)) {
 			return `${PRESET_LABELS[preset]} 模型不支持 ${setting.thinking}`;
 		}
 	}
@@ -159,12 +138,10 @@ export const configureWorkerSettings = async (
 			atomicWriteJson(configPath, validated);
 			return validated;
 		}
-		if (key && RESOLVED_PRESETS.includes(key as ResolvedPreset)) {
-			await configurePreset(ctx, draft, key as ResolvedPreset);
+		if (key && PRESETS.includes(key as WorkerPreset)) {
+			await configurePreset(ctx, draft, key as WorkerPreset);
 		} else if (key === "maxConcurrentWorkers") {
 			draft.maxConcurrentWorkers = await inputInteger(ctx, "并发上限", `1-16，当前：${draft.maxConcurrentWorkers}`, draft.maxConcurrentWorkers, 1, 16);
-		} else if (key === "automaticDelegationEnabled") {
-			draft.automaticDelegationEnabled = await chooseBoolean(ctx, "自动委派", draft.automaticDelegationEnabled);
 		} else if (key === "defaultTimeoutMs") {
 			const seconds = await inputInteger(ctx, "默认超时（秒）", `1-3600，当前：${draft.defaultTimeoutMs / 1_000}`, draft.defaultTimeoutMs / 1_000, 1, 3_600);
 			draft.defaultTimeoutMs = seconds * 1_000;
