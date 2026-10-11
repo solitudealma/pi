@@ -7,10 +7,12 @@ import {
 	attributeChangedFiles,
 	declaredWriteBoundary,
 	filterChangedFilesToBoundary,
-	mapWithConflicts,
-	workerTasksConflict,
+	workerTaskScopesConflict,
 } from "./security.ts";
 import type { WorkerTask } from "./types.ts";
+import { validateWorkerWritePath } from "./guard.ts";
+
+const workerTasksConflict = (left: WorkerTask, right: WorkerTask, cwd: string) => workerTaskScopesConflict(left, cwd, right, cwd);
 
 const readTask = (cwd?: string): WorkerTask => ({ mode: "scout", objective: "read", cwd });
 const writeTask = (allowedPaths: string[], cwd?: string): WorkerTask => ({ mode: "implement", objective: "write", allowedPaths, cwd });
@@ -82,81 +84,6 @@ test("dangling symlink boundaries are unknown and conflict conservatively", asyn
 	assert.equal(workerTasksConflict(writeTask(["dangling/**"]), writeTask(["other/**"]), root), true);
 });
 
-test("scheduler scans past a blocked head, preserves order, isolates failures, and honors limit", async () => {
-	const items = [
-		{ id: 0, group: "a", delay: 35 },
-		{ id: 1, group: "a", delay: 1 },
-		{ id: 2, group: "b", delay: 5, fail: true },
-		{ id: 3, group: "c", delay: 1 },
-	];
-	const starts: number[] = [];
-	let active = 0;
-	let maximum = 0;
-	const results = await mapWithConflicts(items, 2, (left, right) => left.group === right.group, async (item) => {
-		starts.push(item.id);
-		active++;
-		maximum = Math.max(maximum, active);
-		await new Promise((resolve) => setTimeout(resolve, item.delay));
-		active--;
-		if (item.fail) throw new Error("isolated");
-		return { status: "completed", id: item.id };
-	});
-
-	assert.deepEqual(starts.slice(0, 2), [0, 2]);
-	assert.equal(maximum, 2);
-	assert.deepEqual(results.map((item) => item.id), [0, 1, undefined, 3]);
-	assert.deepEqual(results[2], { status: "failed", summary: ["isolated"] });
-});
-
-test("scheduler does not reorder tasks that conflict with an earlier pending task", async () => {
-	const items = [
-		{ id: 0, scopes: ["x"], delay: 10 },
-		{ id: 1, scopes: ["x", "a"], delay: 2 },
-		{ id: 2, scopes: ["a"], delay: 1 },
-	];
-	const starts: number[] = [];
-	await mapWithConflicts(items, 2, (left, right) => left.scopes.some((scope) => right.scopes.includes(scope)), async (item) => {
-		starts.push(item.id);
-		await new Promise((resolve) => setTimeout(resolve, item.delay));
-		return item.id;
-	});
-	assert.deepEqual(starts, [0, 1, 2]);
-});
-
-test("limit one leaves every execution unmarked as overlapping", async () => {
-	const overlaps = await mapWithConflicts([0, 1], 1, () => false, async (_item, _index, execution) => {
-		await new Promise((resolve) => setTimeout(resolve, 2));
-		return [...execution.overlappingIndices];
-	});
-	assert.deepEqual(overlaps, [[], []]);
-});
-
-test("scheduler marks real overlap in both mutable execution contexts", async () => {
-	const items = [
-		{ id: 0, delay: 35 },
-		{ id: 1, delay: 10 },
-		{ id: 2, delay: 5 },
-	];
-	let firstBeforeLaterStart: number[] = [];
-	let firstAfterLaterStart: number[] = [];
-	let laterContext: number[] = [];
-	await mapWithConflicts(items, 2, (left, right) => new Set([left.id, right.id]).size === 2 && left.id !== 0 && right.id !== 0, async (item, _index, execution) => {
-		if (item.id === 0) {
-			await new Promise((resolve) => setTimeout(resolve, 2));
-			firstBeforeLaterStart = [...execution.overlappingIndices];
-			await new Promise((resolve) => setTimeout(resolve, item.delay));
-			firstAfterLaterStart = [...execution.overlappingIndices];
-		} else {
-			if (item.id === 2) laterContext = [...execution.overlappingIndices];
-			await new Promise((resolve) => setTimeout(resolve, item.delay));
-		}
-		return item.id;
-	});
-	assert.deepEqual(firstBeforeLaterStart, [1]);
-	assert.deepEqual(firstAfterLaterStart, [1, 2]);
-	assert.deepEqual(laterContext, [0]);
-});
-
 test("changed_files attribution preserves raw observations and only filters real overlap", async (t) => {
 	const root = await workspace(t);
 	await mkdir(join(root, "packages", "a", "src"), { recursive: true });
@@ -183,4 +110,16 @@ test("changed-file filtering matches exact literal and glob guard semantics", as
 	assert.deepEqual(filterChangedFilesToBoundary(writeTask(["src"]), root, ["src", "src/file.ts"]), ["src"]);
 	assert.deepEqual(filterChangedFilesToBoundary(writeTask(["src/**"]), root, ["src", "src/file.ts"]), ["src/file.ts"]);
 	assert.deepEqual(filterChangedFilesToBoundary(writeTask(["src/*.ts"]), root, ["src/file.ts", "src/file.js", "src/nested/file.ts"]), ["src/file.ts"]);
+});
+
+test("write guard keeps exact file and subtree glob semantics without widening bare paths", async (t) => {
+	const root = await workspace(t);
+	await mkdir(join(root, "backend"));
+	const base = { mode: "implement" as const, cwd: root, forbiddenPaths: [] };
+	assert.match(validateWorkerWritePath({ ...base, allowedPaths: ["backend"] }, "backend/new.ts")!, /超出 allowedPaths/);
+	assert.equal(validateWorkerWritePath({ ...base, allowedPaths: ["backend/**"] }, "backend/new.ts"), undefined);
+	assert.equal(validateWorkerWritePath({ ...base, allowedPaths: ["backend/new.ts"] }, "backend/new.ts"), undefined);
+	assert.match(validateWorkerWritePath({ ...base, allowedPaths: ["backend/new.ts"] }, "backend/other.ts")!, /超出 allowedPaths/);
+	assert.equal(validateWorkerWritePath({ ...base, allowedPaths: ["backend/**"], forbiddenPaths: ["backend"] }, "backend/new.ts"), undefined);
+	assert.match(validateWorkerWritePath({ ...base, allowedPaths: ["backend/**"], forbiddenPaths: ["backend/**"] }, "backend/new.ts")!, /命中 forbiddenPaths/);
 });

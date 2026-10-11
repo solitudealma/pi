@@ -66,6 +66,7 @@ function compactExecution(value: unknown, profile: ResultCompactProfile): unknow
 	const usage = execution.usage && typeof execution.usage === "object" ? execution.usage as Record<string, any> : undefined;
 	// These fixed protocol fields are not subject to the arbitrary-object key cap.
 	return Object.fromEntries(Object.entries({
+		...(execution.session_mode === undefined ? {} : { session_mode: execution.session_mode }),
 		resolved_preset: execution.resolved_preset,
 		actual_model_id: execution.actual_model_id ?? execution.resolved_model_id,
 		actual_thinking: execution.actual_thinking ?? execution.resolved_thinking,
@@ -161,12 +162,6 @@ export function summarizeToolResult(value: unknown): string | undefined {
 		}
 	}
 	return compactUiValue(value, UI_DETAIL_CAP);
-}
-
-export function publicThinking(message: any): string | undefined {
-	if (!message || !Array.isArray(message.content)) return undefined;
-	const thinking = message.content.filter((part: any) => part?.type === "thinking" && typeof part.thinking === "string").map((part: any) => part.thinking.trim()).filter(Boolean).join("\n");
-	return thinking ? uiSnippet(thinking, UI_DETAIL_CAP) : undefined;
 }
 
 export function appendUiActivity(activities: WorkerUiActivity[], activity: WorkerUiActivity): void {
@@ -267,7 +262,6 @@ export function workerUsageText(usage: WorkerUsage, active = false): string {
 export function cloneUiDetails(details: WorkerUiDetails): WorkerUiDetails {
 	return {
 		...details,
-		questions: details.questions?.map((question) => ({ ...question })),
 		controlErrors: details.controlErrors?.map((error) => ({ ...error })),
 		tasks: details.tasks.map((task) => ({ ...task, activities: task.activities.map((activity) => ({ ...activity })), usage: { ...task.usage } })),
 	};
@@ -311,7 +305,6 @@ export function workerConclusions(task: WorkerUiTask): string[] {
 }
 
 export function renderWorkerDetails(details: WorkerUiDetails, theme: Theme, options: { expanded?: boolean; snapshot?: boolean } = {}) {
-	const questions = details.questions ?? [];
 	let text = "";
 	for (const error of details.controlErrors ?? []) text += `${theme.fg("error", `控制错误：${sanitizeUiText(error.message)}`)}\n`;
 	for (const [position, task] of details.tasks.entries()) {
@@ -319,7 +312,7 @@ export function renderWorkerDetails(details: WorkerUiDetails, theme: Theme, opti
 		const duration = uiDuration(task, options.snapshot ? details.snapshotAt ?? details.finishedAt ?? details.startedAt : Date.now());
 		const usage = workerUsageText(task.usage, task.status === "running");
 		const preset = task.resolvedPreset ?? task.requestedPreset;
-		const runtime = [preset, usage, duration].filter(Boolean).join(" · ");
+		const runtime = [preset, task.sessionMode === "fork" ? "fork" : undefined, usage, duration].filter(Boolean).join(" · ");
 		text += `${uiStatusIcon(task.status, theme)} ${theme.fg("accent", task.mode)}${runtime ? theme.fg("muted", ` · ${runtime}`) : ""}`;
 		const objective = sanitizeUiText(task.objective).replace(/\s+/g, " ").trim();
 		text += `\n  ${theme.fg("toolOutput", objective)}`;
@@ -331,14 +324,6 @@ export function renderWorkerDetails(details: WorkerUiDetails, theme: Theme, opti
 				text += theme.fg("muted", "，结论:");
 				for (const conclusion of conclusions) text += `\n    ${theme.fg("toolOutput", `• ${conclusion}`)}`;
 			}
-		}
-		const taskQuestions = details.batchId
-			? questions.filter((question) => question.taskId === `${details.batchId}:${task.index + 1}`)
-			: [];
-		for (const question of taskQuestions) {
-			const body = (value: string) => sanitizeUiText(value).replace(/\n/g, "\n  ");
-			text += `\n  Q: ${theme.fg("toolOutput", body(question.question))}`;
-			if (question.answer !== undefined) text += `\n  A: ${theme.fg("toolOutput", body(question.answer))}`;
 		}
 	}
 	const component = new Text(text, 0, 0);

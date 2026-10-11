@@ -4,33 +4,31 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
-import { MODES, PRESETS, loadRoutingConfig, validateTask } from "./config.ts";
+import { MODES, PRESETS, SESSION_MODES, loadRoutingConfig, validateTask } from "./config.ts";
 import { WORKER_USAGE_EVENT, type WorkerUsageSnapshot } from "./events.ts";
 import { registerWorkerWriteGuard } from "./guard.ts";
+import { captureWorkerSession, type WorkerSessionSnapshot } from "./session.ts";
 import { beginWorkerShutdown, createWorkerOwner, executeTask } from "./process.ts";
 import { workerTaskScopesConflict } from "./security.ts";
 import { configureWorkerSettings } from "./settings-ui.ts";
 import type { WorkerToolInput, WorkerUiDetails } from "./types";
 import { cloneUiDetails, compactWorkerResult, emptyWorkerUsage, renderWorkerDetails, sanitizeStructuredValue, serializePayload } from "./ui.ts";
-import { WorkerRenderRefresh } from "./render-refresh.ts";
-import { WorkerRuntime, type Batch, type QuestionRecord } from "./runtime.ts";
-import { ANSWER_LIMIT } from "./ipc.ts";
-import { present } from "./presentation.ts";
-import { emptyWorkerComponent, workerBranchSnapshots, WORKER_SNAPSHOT_ENTRY } from "./history.ts";
+import { WorkerRuntime, type Batch } from "./runtime.ts";
+import { present, emptyWorkerComponent, workerBranchSnapshots, WORKER_SNAPSHOT_ENTRY, WorkerRenderRefresh } from "./presentation.ts";
 
-export const TOOL_DESCRIPTION = `Autonomously delegate bounded, independently verifiable coding subtasks without asking permission. Use fast for clear local work, normal for ordinary development, deep for difficult work; auto selects among them. Thinking high/xhigh/max is separate and requires model support. Read worker-orchestration for non-trivial decomposition, parallelization, routing, review or acceptance. Workers cannot delegate. Handle failures directly, without automatic retries; review diffs, validation and acceptance evidence yourself.
-Only ONE unfinished batch per session: parallel tasks belong in ONE tasks array, not separate starts. Start: exactly one of task/tasks (optional manual). Continue: {batchId}. Answer: {batchId, answers:[{taskId, questionId, answer}]}, using exact questions[].id. Cancel: {batchId, cancel:true}. Do not mix modes. A second start returns activeBatchId; finish or cancel it first. Answers are validated atomically; duplicate, expired or foreign IDs fail.
-Start/continue/answer waits for a question or batch completion, without polling. Independent work continues; waiting workers retain slots and path locks. Do not edit locked paths. No automatic follow-up messages: keep calling worker until finished before ending your turn. Cancel or abort of an active invocation waits for batch cleanup and lock release; abort after return has no effect.
-For user decisions call ask_question, then explicitly forward answers with the exact question IDs; Esc/cancellation is not consent. Task/question deadlines keep running during confirmation and UI queueing; late answers cannot revive expired work. Cancel relevant batches before global dangerous decisions. Answers never expand permissions: cancel, await cleanup and start a new task instead.`;
+export const TOOL_DESCRIPTION = `Autonomously delegate bounded, verifiable tasks: fast for clear local work, normal for ordinary work, deep for difficult work, or auto. Read worker-orchestration for non-trivial delegation. Choose each task's sessionMode yourself: fork by default; use new only when little context handoff is needed; do not ask the user. Workers cannot delegate. Handle failures without automatic retries; verify diffs and acceptance evidence yourself.
+ONE unfinished batch per session; parallel tasks go in ONE tasks array. Start: exactly one of task/tasks (optional manual). Continue: {batchId}. Cancel: {batchId,cancel:true}. Do not mix modes. A second start returns activeBatchId; finish or cancel it first.
+Start/continue waits for completion; no polling. Finish or cancel all batches before ending your turn. Do not edit locked paths. Missing information/authorization returns blocked; handle in the main agent, then create a new bounded task if needed. Never infer authorization. Deadlines are fixed. Cancel/abort of an active call waits for cleanup and lock release; abort after return has no effect. Scope changes require cancellation, cleanup and a new task.`;
 
 export const TaskSchema = Type.Object({
 	mode: StringEnum(MODES),
 	objective: Type.String({ minLength: 1 }),
 	preset: Type.Optional(StringEnum(PRESETS)),
+	sessionMode: Type.Optional(StringEnum(SESSION_MODES, { description: "Default fork: snapshot current branch at batch start. Use new only for minimal context handoff." })),
 	context: Type.Optional(Type.String()),
-	relevantFiles: Type.Optional(Type.Array(Type.String({ description: "Read hints (relative, absolute or outside cwd); no write permission." }))),
-	allowedPaths: Type.Optional(Type.Array(Type.String({ description: "Write scope relative to task.cwd: exact/new files or globs. Directory children require dir/**; bare directories and dir/ are rejected before start. Not a shell/filesystem sandbox." }))),
-	forbiddenPaths: Type.Optional(Type.Array(Type.String({ description: "Write exclusions relative to task.cwd: exact files or globs. Directory children require dir/**; bare directories and dir/ are rejected before start." }))),
+	relevantFiles: Type.Optional(Type.Array(Type.String({ description: "Read hints, including outside cwd; no write permission." }))),
+	allowedPaths: Type.Optional(Type.Array(Type.String({ description: "Write modes require scope relative to cwd: exact/new files or globs; directory children use dir/**, not dir or dir/. Guards edit/write only, not a sandbox." }))),
+	forbiddenPaths: Type.Optional(Type.Array(Type.String({ description: "Write exclusions relative to cwd: files or globs; directory children use dir/**, not dir or dir/." }))),
 	acceptanceCriteria: Type.Optional(Type.Array(Type.String())),
 	verificationCommands: Type.Optional(Type.Array(Type.String())),
 	outputRequirements: Type.Optional(Type.Array(Type.String())),
@@ -42,12 +40,7 @@ export const InputSchema = Type.Object({
 	tasks: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: 12 })),
 	manual: Type.Optional(Type.Boolean()),
 	batchId: Type.Optional(Type.String({ minLength: 1 })),
-	answers: Type.Optional(Type.Array(Type.Object({
-		taskId: Type.String({ minLength: 1 }), questionId: Type.String({ minLength: 1 }),
-		answer: Type.String({ minLength: 1, maxLength: ANSWER_LIMIT }),
-	}, { additionalProperties: false }), { minItems: 1, maxItems: 384 })),
 	cancel: Type.Optional(Type.Literal(true)),
-	questionOffset: Type.Optional(Type.Integer({ minimum: 0, description: "History page offset in the next question/completion response (8 records/page); does not enable polling" })),
 }, { additionalProperties: false });
 
 /** Validate at execution too: direct callers must not bypass schema or mode constraints. */
@@ -56,25 +49,13 @@ export function validateWorkerInput(input: unknown): asserts input is WorkerTool
 	const value = input as WorkerToolInput;
 	if (value.batchId !== undefined) {
 		if (!value.batchId.trim() || "task" in value || "tasks" in value || "manual" in value) throw new Error("worker 参数错误：batchId 不能与 task/tasks/manual 混用");
-		if (value.cancel && ("answers" in value || "questionOffset" in value)) throw new Error("worker 参数错误：cancel 不能与 answers/questionOffset 混用");
 	} else {
 		if (("task" in value) === ("tasks" in value)) throw new Error("worker 参数错误：task 和 tasks 必须二选一");
-		if ("answers" in value || "cancel" in value || "questionOffset" in value) throw new Error("worker 参数错误：answers/cancel/questionOffset 必须提供 batchId");
+		if ("cancel" in value) throw new Error("worker 参数错误：cancel 必须提供 batchId");
 	}
 }
 
 const respond = <T>(text: string, details: T) => ({ content: [{ type: "text" as const, text }], details });
-
-/** Sanitize question text and any extra fields without rewriting validated routing IDs. */
-function sanitizeQuestionRecord(record: QuestionRecord): QuestionRecord {
-	const sanitized = sanitizeStructuredValue(record) as QuestionRecord;
-	return {
-		...sanitized,
-		id: /^[A-Za-z0-9-]{1,80}$/.test(record.id) ? record.id : sanitized.id,
-		batchId: record.batchId,
-		taskId: record.taskId,
-	};
-}
 
 /** One sanitized, detached view shared by live rows and serialized tool results. */
 export function batchUiSnapshot(batch: Batch): WorkerUiDetails {
@@ -86,30 +67,21 @@ export function batchUiSnapshot(batch: Batch): WorkerUiDetails {
 		toolCallId: error.toolCallId, message: details.controlErrors![index].message,
 	}));
 	details.snapshotAt = Date.now();
-	details.questions = batch.questions.map(sanitizeQuestionRecord);
 	return details;
 }
 
 /** Keep IDs/control state outside result compression so truncation cannot strand a batch. */
-export function batchResponse(batch: Batch, questionOffset?: number) {
+export function batchResponse(batch: Batch) {
 	const results = batch.tasks.map((task) => task.result ?? { status: task.state });
 	const resultPayload = batch.single ? results[0] : { status: results.every((item) => item.status === "completed") ? "completed" : "partial", results };
 	const compressed = serializePayload(resultPayload, batch.maxOutputBytes);
-	const waiting = batch.questions.filter((q) => q.status === "waiting");
-	const offset = questionOffset ?? Math.max(0, batch.questions.length - 8);
-	const history = batch.questions.slice(offset, offset + 8);
 	const payload = {
 		batchId: batch.id,
-		status: batch.finished ? resultPayload.status : batch.cancelled ? "cancelling" : waiting.length ? "waiting_for_reply" : "running",
+		status: batch.finished ? resultPayload.status : batch.cancelled ? "cancelling" : "running",
 		finished: batch.finished,
-		tasks: batch.tasks.map((task) => ({ taskId: task.id, status: task.state === "finished" ? task.result?.status : waiting.some((q) => q.taskId === task.id) ? "waiting_for_reply" : task.state })),
-		questions: waiting.map(sanitizeQuestionRecord),
-		history: history.map(sanitizeQuestionRecord),
-		historyOffset: offset,
-		historyTotal: batch.questions.length,
-		nextHistoryOffset: offset + history.length < batch.questions.length ? offset + history.length : null,
+		tasks: batch.tasks.map((task) => ({ taskId: task.id, status: task.state === "finished" ? task.result?.status : task.state })),
 		result: compressed.payload,
-		next_action: batch.finished ? "Review results and actual diff." : "Call worker({batchId, answers:[{taskId, questionId, answer}]}) for pending questions, worker({batchId}) to continue, or worker({batchId, cancel:true}) to cancel and clean up. Background workers retain path locks.",
+		next_action: batch.finished ? "Review results and actual diff." : "Call worker({batchId}) to await completion, or worker({batchId, cancel:true}) to cancel and clean up. Active tasks retain path locks.",
 	};
 	const details = batchUiSnapshot(batch);
 	details.payload = payload;
@@ -132,7 +104,7 @@ export default function workerExtension(pi: ExtensionAPI, services = { executeTa
 			refresh.changed();
 			if (stopped) return; // Never append old-session cleanup into a newly selected branch.
 			for (const batch of runtime.batches.values()) {
-				const fingerprint = JSON.stringify([batch.tasks.map((t) => [t.state, t.result?.status]), batch.questions, batch.ui.controlErrors]);
+				const fingerprint = JSON.stringify([batch.tasks.map((t) => [t.state, t.result?.status]), batch.ui.controlErrors]);
 				if (persisted.get(batch.id) === fingerprint) continue;
 				persisted.set(batch.id, fingerprint);
 				pi.appendEntry?.(WORKER_SNAPSHOT_ENTRY, batchUiSnapshot(batch));
@@ -216,7 +188,7 @@ export default function workerExtension(pi: ExtensionAPI, services = { executeTa
 				const error = {
 					status: "blocked", error: "active_batch", activeBatchId: active.id,
 					summary: ["本会话已有未完成的 Worker 批次；不能启动第二批次。并行任务须放在同一次 tasks 数组中。"],
-					next_action: "使用 worker({batchId: activeBatchId, answers:[{taskId, questionId, answer}]}) 回答问题、worker({batchId: activeBatchId}) 继续等待，或 worker({batchId: activeBatchId, cancel:true}) 取消并等待清理；完成后再启动新批次。",
+					next_action: "使用 worker({batchId: activeBatchId}) 继续等待，或 worker({batchId: activeBatchId, cancel:true}) 取消并等待清理；完成后再启动新批次。",
 				};
 				return respond(JSON.stringify(error, null, 2), error);
 			};
@@ -224,12 +196,11 @@ export default function workerExtension(pi: ExtensionAPI, services = { executeTa
 				try {
 					const owner = session.runtime;
 					const batch = owner.get(input.batchId);
-					// A pre-aborted continuation must not deliver answers or leave orphan work.
+					// A pre-aborted continuation must not leave orphan work.
 					if (signal?.aborted) owner.cancel(batch.id, "Worker 调用已取消", "invocation_abort");
 					else if (input.cancel) owner.cancel(batch.id);
-					else if (input.answers) owner.replyMany(batch.id, input.answers);
 					await owner.wait(batch.id, signal);
-					return batchResponse(batch, input.questionOffset);
+					return batchResponse(batch);
 				} catch (error) { return fail(error); }
 			}
 			const blocked = activeStartError(session.runtime);
@@ -253,7 +224,7 @@ export default function workerExtension(pi: ExtensionAPI, services = { executeTa
 			let toolActive = true;
 			const uiDetails: WorkerUiDetails = {
 				kind: "worker-ui", originToolCallId: toolCallId, startedAt: Date.now(), limit: loaded.config.maxConcurrentWorkers, total: tasks.length, completed: 0,
-				tasks: tasks.map((task, index) => ({ index, mode: task.mode, objective: task.objective, status: "queued", requestedPreset: task.preset ?? "auto", attempt: 0, phase: "等待执行", activities: [], toolCalls: 0, usage: emptyWorkerUsage() })),
+				tasks: tasks.map((task, index) => ({ index, mode: task.mode, objective: task.objective, status: "queued", requestedPreset: task.preset ?? "auto", sessionMode: task.sessionMode ?? "fork", attempt: 0, phase: "等待执行", activities: [], toolCalls: 0, usage: emptyWorkerUsage() })),
 			};
 			const emitTaskUsage = (task: WorkerUiDetails["tasks"][number]) => {
 				const snapshot: WorkerUsageSnapshot = { taskId: `${toolCallId}:${task.index}`, input: task.usage.input, output: task.usage.output };
@@ -263,6 +234,12 @@ export default function workerExtension(pi: ExtensionAPI, services = { executeTa
 			// check and start, including reentrant calls from configuration/UI callbacks.
 			const blockedAtAdmission = activeStartError(owner);
 			if (blockedAtAdmission) return blockedAtAdmission;
+			let sessionSnapshot: WorkerSessionSnapshot | undefined;
+			try {
+				if (tasks.some((task) => task.sessionMode !== "new")) sessionSnapshot = captureWorkerSession(ctx.sessionManager);
+			} catch (error) {
+				return respond(JSON.stringify({ status: "blocked", summary: [`Worker 会话快照失败：${error instanceof Error ? error.message : String(error)}`] }), { status: "blocked" });
+			}
 			const batch = owner.start({
 				limit: loaded.config.maxConcurrentWorkers, timeoutMs: loaded.config.defaultTimeoutMs,
 				maxOutputBytes: loaded.config.maxOutputBytes, single: !!input.task, ui: uiDetails,
@@ -274,7 +251,7 @@ export default function workerExtension(pi: ExtensionAPI, services = { executeTa
 						emitTaskUsage(uiTask);
 						owner.changed();
 						if (toolActive) present(() => onUpdate?.(respond(`${running.task.mode} ${uiTask.phase}`, batchUiSnapshot(running.batch))));
-					}, () => running.overlappedWriter, (question, questionSignal) => owner.ask(running, question, questionSignal), true, invocationSession.processes);
+					}, () => running.overlappedWriter, true, invocationSession.processes, running.task.sessionMode !== "new" ? sessionSnapshot : undefined);
 					const sanitized = sanitizeStructuredValue(item) as Record<string, any>;
 					const compact = compactWorkerResult(sanitized);
 					compact.observed_changed_files = Array.isArray(sanitized.observed_changed_files) ? sanitized.observed_changed_files : [];

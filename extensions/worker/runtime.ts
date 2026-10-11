@@ -1,17 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { ParentQuestion } from "./ipc.ts";
-import { ANSWER_LIMIT, MAX_QUESTIONS } from "./ipc.ts";
-import type { WorkerAnswer, WorkerTask, WorkerUiDetails } from "./types.ts";
+import type { WorkerTask, WorkerUiDetails } from "./types.ts";
 
-export interface QuestionRecord extends ParentQuestion {
-	batchId: string;
-	taskId: string;
-	status: "waiting" | "answered" | "expired" | "cancelled";
-	askedAt: number;
-	expiresAt: number;
-	answeredAt?: number;
-	answer?: string;
-}
 export interface RuntimeTask {
 	id: string;
 	index: number;
@@ -34,25 +23,15 @@ export interface Batch {
 	single: boolean;
 	ui: WorkerUiDetails;
 	tasks: RuntimeTask[];
-	questions: QuestionRecord[];
 	finished: boolean;
 	cancelled: boolean;
 	execute: (task: RuntimeTask) => Promise<Record<string, any>>;
 }
-interface PendingAnswer {
-	record: QuestionRecord;
-	resolve: (value: string) => void;
-	reject: (error: Error) => void;
-	cleanup: () => void;
-	task: RuntimeTask;
-}
-
-/** Session-owned queue: slots and path locks span ALL batches, including Q&A waits. */
+/** Session-owned queue: slots and path locks span all batches until task cleanup. */
 export class WorkerRuntime {
 	readonly batches = new Map<string, Batch>();
 	private queue: RuntimeTask[] = [];
 	private active = new Set<RuntimeTask>();
-	private pending = new Map<string, PendingAnswer>();
 	private listeners = new Set<() => void>();
 	private closed = false;
 	private scheduling = false;
@@ -64,10 +43,10 @@ export class WorkerRuntime {
 		try { this.onChange(); } catch { /* UI may already be disposed */ }
 		for (const listener of [...this.listeners]) listener();
 	}
-	start(input: Omit<Batch, "id" | "tasks" | "questions" | "finished" | "cancelled">, tasks: WorkerTask[], cwd: string): Batch {
+	start(input: Omit<Batch, "id" | "tasks" | "finished" | "cancelled">, tasks: WorkerTask[], cwd: string): Batch {
 		if (this.closed) throw new Error("Worker 会话已关闭");
 		if (this.batches.size >= 64) throw new Error("本会话已达 64 个 Worker 批次上限；请在新会话继续");
-		const batch: Batch = { ...input, id: randomUUID(), tasks: [], questions: [], finished: false, cancelled: false };
+		const batch: Batch = { ...input, id: randomUUID(), tasks: [], finished: false, cancelled: false };
 		batch.ui.batchId = batch.id;
 		batch.tasks = tasks.map((task, index) => ({ id: `${batch.id}:${index + 1}`, index, batch, task, cwd, state: "queued", controller: new AbortController(), overlappedWriter: false }));
 		this.batches.set(batch.id, batch);
@@ -136,7 +115,6 @@ export class WorkerRuntime {
 	}
 	private finish(task: RuntimeTask) {
 		task.state = "finished";
-		for (const pending of [...this.pending.values()]) if (pending.record.taskId === task.id) this.endQuestion(pending, "expired", "Worker 已结束");
 		const ui = task.batch.ui.tasks[task.index];
 		ui.result = task.result;
 		ui.status = task.result?.status === "completed" ? "completed" : task.result?.status === "blocked" ? "blocked" : "failed";
@@ -146,75 +124,10 @@ export class WorkerRuntime {
 		task.batch.finished = task.batch.tasks.every((item) => item.state === "finished");
 		if (task.batch.finished) task.batch.ui.finishedAt = Date.now();
 	}
-	ask(task: RuntimeTask, question: ParentQuestion, signal: AbortSignal): Promise<string> {
-		if (this.closed || task.state !== "running" || task.controller.signal.aborted || signal.aborted) return Promise.reject(new Error("Worker 已结束或取消"));
-		if (task.deadline === undefined || Date.now() >= task.deadline) return Promise.reject(new Error("Worker 任务已过期"));
-		if (task.batch.questions.some((item) => item.id === question.id) || task.batch.questions.filter((item) => item.taskId === task.id).length >= MAX_QUESTIONS) return Promise.reject(new Error("重复问题 ID 或问题数量超过限制"));
-		const askedAt = Date.now();
-		const record: QuestionRecord = { ...question, batchId: task.batch.id, taskId: task.id, askedAt, expiresAt: askedAt + question.timeoutMs, status: "waiting" };
-		task.batch.questions.push(record);
-		return new Promise((resolve, reject) => {
-			const abort = () => this.endQuestion(pending, signal.reason?.name === "TimeoutError" ? "expired" : "cancelled", signal.reason instanceof Error ? signal.reason.message : "问题已取消或 IPC 已关闭");
-			const timer = setTimeout(() => this.endQuestion(pending, "expired", "等待主 Agent 回答超时"), question.timeoutMs);
-			timer.unref();
-			const pending: PendingAnswer = { record, resolve, reject, task, cleanup: () => {
-				clearTimeout(timer); signal.removeEventListener("abort", abort);
-			} };
-			this.pending.set(`${task.id}/${question.id}`, pending);
-			signal.addEventListener("abort", abort, { once: true });
-			this.changed();
-		});
-	}
-	private endQuestion(pending: PendingAnswer, status: "expired" | "cancelled", reason: string) {
-		if (pending.record.status !== "waiting") return;
-		pending.record.status = status;
-		pending.cleanup();
-		this.pending.delete(`${pending.record.taskId}/${pending.record.id}`);
-		pending.reject(new Error(reason));
-		this.changed();
-	}
-	reply(batchId: string, taskId: string, questionId: string, answer: string): QuestionRecord {
-		return this.replyMany(batchId, [{ taskId, questionId, answer }])[0];
-	}
-	/** Validate the entire submission before resolving ANY worker (no partial application). */
-	replyMany(batchId: string, answers: WorkerAnswer[]): QuestionRecord[] {
-		const batch = this.get(batchId);
-		if (!Array.isArray(answers) || !answers.length || answers.length > batch.tasks.length * MAX_QUESTIONS) throw new Error("answers 必须为非空且不超过批次问题上限的数组");
-		const seen = new Set<string>();
-		const now = Date.now();
-		const validated = answers.map((item) => {
-			if (!item || typeof item.taskId !== "string" || typeof item.questionId !== "string" || typeof item.answer !== "string" || !item.answer.trim() || item.answer.length > ANSWER_LIMIT) throw new Error("回答标识无效、回答为空或超过长度限制");
-			const key = `${item.taskId}/${item.questionId}`;
-			if (seen.has(key)) throw new Error("answers 包含重复问题");
-			seen.add(key);
-			if (!batch.tasks.some((task) => task.id === item.taskId)) throw new Error("未知或跨批次的 taskId");
-			const record = batch.questions.find((q) => q.id === item.questionId);
-			if (!record) throw new Error("未知或跨批次的 questionId");
-			if (record.taskId !== item.taskId) throw new Error("questionId 属于其他任务，不能跨任务回答");
-			if (record.status === "answered") throw new Error("问题已回答，不能重复回答");
-			if (record.status !== "waiting") throw new Error("问题已取消或过期");
-			const pending = this.pending.get(key);
-			if (!pending || now >= record.expiresAt || pending.record !== record) throw new Error("问题已过期");
-			if (this.closed || batch.cancelled || batch.finished || pending.task.state !== "running" || pending.task.controller.signal.aborted) throw new Error("Worker 任务已结束或取消，问题已过期");
-			if (pending.task.deadline === undefined || now >= pending.task.deadline) throw new Error("Worker 任务总期限已过期");
-			return { pending, answer: item.answer };
-		});
-		for (const { pending, answer } of validated) {
-			pending.record.status = "answered";
-			pending.record.answer = answer;
-			pending.record.answeredAt = now;
-			pending.cleanup();
-			this.pending.delete(`${pending.record.taskId}/${pending.record.id}`);
-			pending.resolve(answer);
-		}
-		this.changed();
-		return validated.map(({ pending }) => pending.record);
-	}
 	private cancelTask(task: RuntimeTask, reason: string, source: string) {
 		if (task.state === "finished") return;
 		clearTimeout(task.timer);
 		task.controller.abort(Object.assign(new Error(reason), { source }));
-		for (const pending of [...this.pending.values()]) if (pending.record.taskId === task.id) this.endQuestion(pending, "cancelled", reason);
 		if (task.state === "queued") {
 			this.queue = this.queue.filter((item) => item !== task);
 			task.result = { ...this.failure(reason),
@@ -238,7 +151,7 @@ export class WorkerRuntime {
 		return new Promise((resolve) => {
 			const finish = () => { this.listeners.delete(check); signal?.removeEventListener("abort", abort); resolve(); };
 			const check = () => {
-				if (batch.finished || (!batch.cancelled && !this.closed && batch.questions.some((q) => q.status === "waiting"))) finish();
+				if (batch.finished) finish();
 			};
 			const abort = () => this.cancel(batch.id, "Worker 调用已取消", "invocation_abort");
 			this.listeners.add(check);

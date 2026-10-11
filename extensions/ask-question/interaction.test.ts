@@ -5,8 +5,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Container } from "@earendil-works/pi-tui";
 import askQuestion from "./index.ts";
-import workerExtension from "../worker/index.ts";
-import { DEFAULT_OPTIONS } from "../worker/config.ts";
 
 // Use installed Pi's real editor-replacing custom lifecycle, not concurrent UI mocks.
 const piRoot = dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")));
@@ -236,50 +234,6 @@ test("a shared invocation abort cancels the active editor and all queued calls",
 	assert.equal(h.opens(), 1); assert.equal(h.closes(), 1);
 	assert.deepEqual(h.surface.editorContainer.children, [h.editor]);
 });
-
-for (const expires of ["question", "task", "neither"] as const) {
-	test(`registered ask_question keeps ordinary deadlines and explicit parent replies (${expires} expires)`, async (t) => {
-		t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
-		const h = harness();
-		const oldDepth = process.env.PI_WORKER_DEPTH;
-		process.env.PI_WORKER_DEPTH = "0";
-		let received: string | undefined; let independent = false;
-		const preset = { model: "fixture/local", thinking: "high" as const };
-		try {
-			workerExtension(h.pi as any, { loadRoutingConfig: () => ({ config: { ...DEFAULT_OPTIONS, defaultTimeoutMs: expires === "task" ? 100 : 300, fast: preset, normal: preset, deep: preset, max: preset }, warnings: [], path: "test" }),
-				executeTask: async (task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-					if (task.objective === "ask") received = await ask!({ id: "human-q", question: "Need approval", timeoutMs: expires === "question" ? 100 : 300 }, signal!);
-					else independent = true;
-					return { status: "completed" };
-				},
-			});
-		} finally { if (oldDepth === undefined) delete process.env.PI_WORKER_DEPTH; else process.env.PI_WORKER_DEPTH = oldDepth; }
-		await h.event("session_start");
-		const worker = h.tools.get("worker");
-		try {
-			const first = await worker.execute("origin", { tasks: [{ mode: "scout", objective: "ask" }, { mode: "scout", objective: "independent" }] }, undefined, undefined, h.ctx);
-			const human = h.call(single); const queued = h.call(multi);
-			await flush(); assert.equal(h.opens(), 1);
-			t.mock.timers.tick(100); await flush();
-			assert.equal(independent, true); assert.equal(received, undefined);
-			const state = await worker.execute("wait", { batchId: first.details.batchId });
-			assert.equal(state.details.completed, expires === "neither" ? 1 : 2);
-			assert.equal(state.details.questions[0].status, expires === "neither" ? "waiting" : expires === "question" ? "expired" : "cancelled");
-			if (expires === "task") assert.equal(state.details.tasks[0].result.failure.category, "timeout");
-			assert.equal(h.closes(), 0, "ordinary Worker expiry does not fabricate or close a user answer");
-			h.input("\r"); assert.equal((await human).details.answer, "A");
-			await flush(); h.input("\x1b"); await queued;
-			assert.equal(received, undefined, "only the real parent Agent may answer the Worker");
-			const q = first.details.questions[0];
-			const reply = worker.execute("reply", { batchId: first.details.batchId, answers: [{ taskId: q.taskId, questionId: q.id, answer: "parent chooses A" }] });
-			if (expires === "neither") {
-				const result = await reply;
-				assert.equal(result.details.completed, 2);
-				assert.equal(received, "parent chooses A");
-			} else await assert.rejects(reply, /过期|取消/);
-		} finally { await h.event("session_shutdown"); t.mock.timers.reset(); }
-	});
-}
 
 // No separate UI waiting limit: lifetime is owned by completion, signal and session.
 test("elapsed wall time does not impose a separate questionnaire or queue timeout", async (t) => {

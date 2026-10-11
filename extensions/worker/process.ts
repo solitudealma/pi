@@ -1,14 +1,13 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { present } from "./presentation.ts";
+import { captureWorkerSession, workerSessionArgs, type WorkerSessionSnapshot } from "./session.ts";
 import { randomUUID } from "node:crypto";
-import type { Duplex } from "node:stream";
-import { ParentChannel, PARENT_FD_ENV, type AskParent } from "./ipc.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import { agentDir, resolveRoute, resolveTaskCwd } from "./config.ts";
+import { buildTaskPrompt, workerPromptBody } from "./prompt.ts";
+import { resolveRoute, resolveTaskCwd } from "./config.ts";
 import { WORKER_ALLOWED_PATHS_ENV, WORKER_CWD_ENV, WORKER_FORBIDDEN_PATHS_ENV, WORKER_MODE_ENV } from "./guard.ts";
 import { attributeChangedFiles, changedSince, snapshotWorkspace } from "./security.ts";
 import type { ChildProgress, ChildResult, Route, RoutingConfig, WorkerTask, WorkerUiActivity, WorkerUiActivityStatus, WorkerUiTask, WorkerUsage, WorkspaceSnapshot } from "./types";
@@ -37,10 +36,6 @@ if (!globals[exitKey]) {
 }
 const exitOwners = globals[exitKey].owners;
 const defaultOwner = createWorkerOwner();
-// Backwards-compatible standalone test/caller observations, never used by extensions.
-export const activeChildren = defaultOwner.children;
-export let activeSlots = 0;
-export const slotWaiters = defaultOwner.waiters;
 function forgetChild(owner: WorkerOwner, child: ChildProcess) {
 	owner.children.delete(child);
 	owner.stops.delete(child);
@@ -100,20 +95,8 @@ function processGroupActive(pid: number): boolean | undefined {
 	} catch { return undefined; }
 }
 
-export function killAllChildren(force = false, owner: WorkerOwner = defaultOwner): void {
-	const children = [...owner.children];
-	for (const child of children) killProcessTree(child, force ? "SIGKILL" : "SIGTERM");
-	if (!force && children.length > 0) {
-		setTimeout(() => {
-			// Never kill a new session's children from an old shutdown timer.
-			for (const child of children) if (owner.children.has(child)) killProcessTree(child, "SIGKILL");
-		}, 3_000).unref();
-	}
-}
-
-export function releaseSlot(owner: WorkerOwner = defaultOwner): void {
+function releaseSlot(owner: WorkerOwner): void {
 	owner.slots = Math.max(0, owner.slots - 1);
-	if (owner === defaultOwner) activeSlots = owner.slots;
 	for (const waiter of [...owner.waiters]) waiter();
 }
 
@@ -121,7 +104,6 @@ export async function acquireSlot(limit: number, signal: AbortSignal | undefined
 	if (signal?.aborted || owner.closed) throw new Error("Worker 在等待执行槽位时已取消");
 	const take = () => {
 		owner.slots++;
-		if (owner === defaultOwner) activeSlots = owner.slots;
 		let released = false;
 		return () => { if (!released) { released = true; releaseSlot(owner); } };
 	};
@@ -156,32 +138,6 @@ export async function acquireSlot(limit: number, signal: AbortSignal | undefined
 	});
 }
 
-export function workerPromptBody(): string {
-	const promptPath = path.join(agentDir(), "extensions", "worker", "agents", "worker.md");
-	if (!fs.existsSync(promptPath)) throw new Error(`缺少 Worker Prompt: ${promptPath}`);
-	const parsed = parseFrontmatter<Record<string, string>>(fs.readFileSync(promptPath, "utf8"));
-	return parsed.body.trim();
-}
-
-export function buildTaskPrompt(task: WorkerTask, route: Route, before: WorkspaceSnapshot | null): string {
-	const existing = before ? [...before.statusPaths].map((item) => path.relative(before.cwd, path.join(before.gitRoot, item)).replaceAll("\\", "/")) : [];
-	const contract = {
-		mode: task.mode,
-		objective: task.objective.trim(),
-		context: task.context ?? "",
-		relevantFiles: task.relevantFiles ?? [],
-		allowedPaths: task.allowedPaths ?? [],
-		forbiddenPaths: task.forbiddenPaths ?? [],
-		acceptanceCriteria: task.acceptanceCriteria ?? [],
-		verificationCommands: task.verificationCommands ?? [],
-		outputRequirements: task.outputRequirements ?? [],
-		cwd: before?.cwd,
-		preExistingUserChanges: existing,
-		execution: { preset: route.resolvedPreset, model: route.modelId, thinking: route.thinking },
-	};
-	return `执行以下单一 Worker 任务。不要创建或调用其他 Worker。\n\n任务契约：\n${JSON.stringify(contract, null, 2)}\n\n最终只返回一个 JSON 对象，不要 Markdown 代码围栏，不要隐藏思考过程，不要完整日志。summary 需用 2-4 条简洁但具体的文字说明主要工作或发现、验证结果和重要限制，每条应能独立理解。格式：\n${JSON.stringify({ status: "completed | blocked | failed", summary: ["具体结论"], changed_files: ["path"], validation: [{ command: "command", result: "passed | failed | not_run", details: "简要证据" }], acceptance: [{ criterion: "验收条件", result: "passed | failed | uncertain", evidence: "证据" }], findings: [], risks: [], out_of_scope: [], recommended_next_action: [] }, null, 2)}`;
-}
-
 export function extractText(message: any): string {
 	if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return "";
 	return message.content.filter((item: any) => item?.type === "text" && typeof item.text === "string").map((item: any) => item.text).join("\n");
@@ -197,7 +153,7 @@ export async function runPiWorker(
 	timeoutMs: number,
 	concurrencyLimit: number,
 	onProgress?: (progress: ChildProgress) => void,
-	control?: { askParent?: AskParent; invocation?: { command: string; args: string[] }; managedTimeout?: boolean; owner?: WorkerOwner },
+	control?: { invocation?: { command: string; args: string[] }; managedTimeout?: boolean; owner?: WorkerOwner; sessionSnapshot?: WorkerSessionSnapshot },
 ): Promise<ChildResult> {
 	const owner = control?.owner ?? defaultOwner;
 	const activities: WorkerUiActivity[] = [];
@@ -253,7 +209,8 @@ export async function runPiWorker(
 	try {
 		const systemPath = path.join(tempDir, "worker-system.md");
 		await fs.promises.writeFile(systemPath, systemPrompt, { encoding: "utf8", mode: 0o600 });
-		const args = ["--mode", "json", "--print", "--no-session", "--no-skills", "--no-context-files", "--extension", path.join(agentDir(), "extensions", "worker", "ask-parent.ts"), "--model", route.modelId, "--thinking", route.thinking, "--append-system-prompt", systemPath, prompt];
+		const sessionArgs = await workerSessionArgs(task, cwd, tempDir, control?.sessionSnapshot);
+		const args = ["--mode", "json", "--print", ...sessionArgs, "--no-skills", "--no-context-files", "--model", route.modelId, "--thinking", route.thinking, "--append-system-prompt", systemPath, prompt];
 		const invocation = control?.invocation ?? getPiInvocation(args);
 		const deadline = Date.now() + timeoutMs;
 		try {
@@ -307,11 +264,10 @@ export async function runPiWorker(
 				cwd,
 				shell: false,
 				detached: process.platform !== "win32",
-				stdio: ["ignore", "pipe", "pipe", "pipe"],
+				stdio: ["ignore", "pipe", "pipe"],
 				env: {
 					...process.env,
 					PI_WORKER_DEPTH: "1",
-					[PARENT_FD_ENV]: "3",
 					PI_SKIP_VERSION_CHECK: "1",
 					[WORKER_MODE_ENV]: task.mode,
 					[WORKER_CWD_ENV]: cwd,
@@ -322,26 +278,15 @@ export async function runPiWorker(
 			});
 			owner.children.add(child);
 			exitOwners.add(owner);
-			const channel = new ParentChannel(child.stdio[3] as Duplex, control?.askParent ?? (async () => { throw new Error("父进程不支持问答"); }), (close) => {
-				if (settled || terminating || close.source === "local") return;
-				if (signal?.aborted) { abortHandler(); return; }
-				// A clean EOF with no outstanding question commonly precedes child close.
-				if (close.source === "eof" && !close.pending) return;
-				diagnostic = { stage: "ipc", code: close.code, source: close.source, parentPid: process.pid, workerPid: child.pid, ownerId: owner.id };
-				errorMessage = `Worker IPC failure [stage=ipc code=${close.code} source=${close.source} pending=${close.pending} parent=${process.pid} worker=${child.pid ?? "unknown"} owner=${owner.id}]；连接已关闭，不得猜测授权或自动重试`;
-				terminate("ipc");
-			});
 			const finish = (exitCode: number, childClosed = true) => {
 				if (settled) return;
 				settled = true;
-				channel.close("completed");
 				clearTimeout(timeout);
 				if (forceKillTimer) clearTimeout(forceKillTimer);
 				if (forceSettleTimer) clearTimeout(forceSettleTimer);
 				if (groupCheckTimer) clearTimeout(groupCheckTimer);
 				signal?.removeEventListener("abort", abortHandler);
 				if (childClosed) forgetChild(owner, child);
-				if (diagnostic?.stage === "ipc" && exitCode === 0) exitCode = 1;
 				phase = aborted ? "已取消" : timedOut ? "已超时" : exitCode === 0 ? "子进程已完成" : "子进程失败";
 				for (const activity of activities) {
 					if (activity.status !== "running") continue;
@@ -363,7 +308,7 @@ export async function runPiWorker(
 				groupCheckTimer = setTimeout(checkClosedGroup, 100);
 				// Keep the cleanup alive even when the group leader closed all its pipes.
 			};
-			const terminate = (reason: "abort" | "timeout" | "output" | "ipc" | "owner_shutdown") => {
+			const terminate = (reason: "abort" | "timeout" | "output" | "owner_shutdown") => {
 				if (settled || terminating) return;
 				terminating = true;
 				const source = reason === "abort" ? terminationSource(signal) : reason;
@@ -371,7 +316,6 @@ export async function runPiWorker(
 				aborted = (reason === "abort" && source !== "task_timeout") || reason === "owner_shutdown";
 				timedOut = reason === "timeout" || source === "task_timeout";
 				errorMessage ||= `Worker 已终止 [source=${source} parent=${process.pid} worker=${child.pid ?? "unknown"} owner=${owner.id}]`;
-				channel.close(timedOut ? "timeout" : reason === "ipc" ? "ipc_failure" : reason === "output" ? "output" : reason === "owner_shutdown" || source === "session_shutdown" ? "owner_shutdown" : "cancelled");
 				killProcessTree(child, "SIGTERM");
 				forceKillTimer = setTimeout(() => {
 					if (settled) return;
@@ -387,7 +331,7 @@ export async function runPiWorker(
 				}, WORKER_TERMINATE_GRACE_MS);
 				forceKillTimer.unref();
 				// Install cleanup before notifying presentation code (including reentrancy).
-				setPhase(aborted ? "正在取消" : timedOut ? "正在终止超时任务" : reason === "ipc" ? "正在终止 IPC 故障任务" : "正在终止超限输出", "failed");
+				setPhase(aborted ? "正在取消" : timedOut ? "正在终止超时任务" : "正在终止超限输出", "failed");
 			};
 			const abortHandler = () => terminate("abort");
 			owner.stops.set(child, () => terminate("owner_shutdown"));
@@ -531,6 +475,7 @@ export function isBlockedFailure(child: ChildResult): boolean {
 
 export function baseExecution(task: WorkerTask, route: Route | null, attempt: number, warnings: string[]) {
 	return {
+		session_mode: task.sessionMode ?? "fork",
 		requested_preset: task.preset ?? "auto",
 		resolved_preset: route?.resolvedPreset ?? null,
 		resolved_model_id: route?.modelId ?? null,
@@ -550,7 +495,7 @@ export function failureDetails(category: string, reason: string) {
 	};
 }
 
-export async function executeTask(task: WorkerTask, config: RoutingConfig, warnings: string[], ctx: ExtensionContext, signal: AbortSignal | undefined, onProgress?: (patch: Partial<WorkerUiTask>) => void, hadConcurrentWriter: () => boolean = () => false, askParent?: AskParent, managedTimeout = false, owner: WorkerOwner = defaultOwner): Promise<Record<string, any>> {
+export async function executeTask(task: WorkerTask, config: RoutingConfig, warnings: string[], ctx: ExtensionContext, signal: AbortSignal | undefined, onProgress?: (patch: Partial<WorkerUiTask>) => void, hadConcurrentWriter: () => boolean = () => false, managedTimeout = false, owner: WorkerOwner = defaultOwner, sessionSnapshot?: WorkerSessionSnapshot): Promise<Record<string, any>> {
 	const cwd = resolveTaskCwd(ctx.cwd, task.cwd);
 	const report = (patch: Partial<WorkerUiTask>) => present(() => onProgress?.(patch));
 	let route: Route | null = null;
@@ -558,6 +503,12 @@ export async function executeTask(task: WorkerTask, config: RoutingConfig, warni
 	let stage = "route_or_contract";
 	report({ status: "running", phase: "解析模型路由" });
 	try {
+		if (task.sessionMode !== undefined && task.sessionMode !== "new" && task.sessionMode !== "fork") throw new Error(`无效 sessionMode: ${String(task.sessionMode)}`);
+		if (task.sessionMode !== "new" && !sessionSnapshot) {
+			stage = "session_snapshot";
+			sessionSnapshot = captureWorkerSession(ctx.sessionManager);
+		}
+		stage = "route_or_contract";
 		route = resolveRoute(task, config, ctx);
 		report({ resolvedPreset: route.resolvedPreset, modelId: route.modelId, thinking: route.thinking, phase: "记录 Git 状态" });
 		stage = "workspace_snapshot";
@@ -575,12 +526,12 @@ export async function executeTask(task: WorkerTask, config: RoutingConfig, warni
 		route,
 		cwd,
 		systemPrompt,
-		buildTaskPrompt(task, route, before),
+		buildTaskPrompt(task, before),
 		signal,
 		config.defaultTimeoutMs,
 		config.maxConcurrentWorkers,
 		(progress) => report({ phase: progress.phase, activities: progress.activities, toolCalls: progress.toolCalls, usage: progress.usage }),
-		{ askParent, managedTimeout, owner },
+		{ managedTimeout, owner, sessionSnapshot },
 	);
 	report({ phase: "校验结果与修改范围", activities: child.activities, toolCalls: child.toolCalls, usage: child.usage });
 	const parsed = parseStructuredResult(child.assistantText);
@@ -596,7 +547,7 @@ export async function executeTask(task: WorkerTask, config: RoutingConfig, warni
 	const risks = Array.isArray(parsed?.risks) ? [...parsed.risks] : [];
 	if (deltaError) { risks.push(deltaError); status = "failed"; }
 	if (attribution.attributedToDeclaredPaths) risks.unshift("任务与兄弟写任务真实重叠并共享 Git worktree；changed_files 已按本任务规范化 allowedPaths 取交集。observed_changed_files 保留快照观察到的完整原始 delta，其中范围外变化的来源无法由共享 worktree 快照证明。");
-	if (child.aborted || child.timedOut || child.exitCode !== 0 || child.errorMessage || !parsed || actualMismatch) status = child.termination?.stage === "ipc" ? "failed" : isBlockedFailure(child) ? "blocked" : "failed";
+	if (child.aborted || child.timedOut || child.exitCode !== 0 || child.errorMessage || !parsed || actualMismatch) status = isBlockedFailure(child) ? "blocked" : "failed";
 	if (actualMismatch) risks.push(`实际模型 ${child.actualProvider}/${child.actualModel} 与请求 ${route.modelId} 不一致`);
 	if (child.truncated) risks.push("Worker 事件输出超过上限，已截断");
 	const summary = Array.isArray(parsed?.summary) ? parsed.summary : [child.aborted ? "Worker 已取消" : child.timedOut ? "Worker 超时" : child.errorMessage || child.stderr || "Worker 未返回可解析 JSON"];
@@ -604,9 +555,8 @@ export async function executeTask(task: WorkerTask, config: RoutingConfig, warni
 	if (status !== "completed") {
 		const category = child.aborted ? "cancelled"
 			: child.timedOut ? "timeout"
-				: child.termination?.stage === "ipc" ? "ipc_failure"
-					: actualMismatch ? "model_mismatch"
-						: status === "blocked" ? "worker_blocked"
+				: actualMismatch ? "model_mismatch"
+					: status === "blocked" ? "worker_blocked"
 						: child.truncated ? "protocol_output_limit"
 							: child.exitCode !== 0 ? "process_exit"
 								: child.errorMessage ? "runtime_error"
@@ -633,10 +583,6 @@ export async function executeTask(task: WorkerTask, config: RoutingConfig, warni
 		recommended_next_action: failure ? [failure.next_action] : Array.isArray(parsed?.recommended_next_action) ? parsed.recommended_next_action : ["主 Agent 检查实际 diff 和验证证据"],
 	};
 }
-export function resetWorkerRuntime(): void {
-	defaultOwner.closed = false;
-}
-
 export function beginWorkerShutdown(owner: WorkerOwner = defaultOwner): void {
 	if (owner.closed) return;
 	owner.closed = true;

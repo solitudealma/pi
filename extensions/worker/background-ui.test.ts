@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { setTimeout as delay } from "node:timers/promises";
 import { Text, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import workerExtension, { batchResponse } from "./index.ts";
@@ -15,7 +14,6 @@ import { patchCollapsedThinkingPreview, patchCompactToolDisplay, patchFinalRespo
 
 const theme = { fg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
 const secret = (name: string) => `${name}=${name}-fixture-hidden`;
-const questionId = "a".repeat(64);
 const complete = { status: "completed", summary: ["done"] };
 
 function harness(execute: typeof executeTask) {
@@ -62,180 +60,70 @@ async function piToolComponent() {
 	return (await import(pathToFileURL(join(root, "modes/interactive/components/tool-execution.js")).href)).ToolExecutionComponent;
 }
 
-test("original Pi tool row keeps refreshing after execute, reply and background completion without later wait rendering", async () => {
-	let release!: () => void;
+
+test("original Pi card receives progress until completion and continuations remain hidden", async () => {
+	let release!: () => void, ready = false;
 	const hold = new Promise<void>((resolve) => { release = resolve; });
-	const h = harness(async (task, _config, _warnings, _ctx, signal, progress, _overlap, ask) => {
+	const h = harness(async (_task, _config, _warnings, _ctx, _signal, progress) => {
 		progress?.({ status: "running", phase: "运行", usage: { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, contextTokens: 30, turns: 1 } });
-		if (task.objective === "ask") {
-			await ask!({ id: questionId, question: `继续吗？ ${secret("password")}`, timeoutMs: 2_000 }, signal!);
-			await hold;
-		} else await delay(20);
-		return { ...complete, observed_changed_files: ["observed.ts"], execution: { usage: { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, contextTokens: 30, turns: 1 } } };
+		ready = true; await hold;
+		return { ...complete, execution: { usage: { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, contextTokens: 30, turns: 1 } } };
 	});
 	await h.handlers.get("session_start")({}, h.ctx);
 	try {
-		assert.deepEqual([...h.commands.keys()], ["worker_settings"]);
-		assert.deepEqual([...h.tools.keys()], ["worker"]);
 		const tool = h.tools.get("worker");
-		const args = { tasks: [{ mode: "scout", objective: "ask" }, { mode: "scout", objective: "independent" }] };
+		const args = { task: { mode: "scout", objective: "live task" } };
 		const Component = await piToolComponent();
-		let paints = 0;
-		const row = new Component("worker", "owner", args, {}, tool, { requestRender() { paints++; } }, process.cwd());
+		const row = new Component("worker", "owner", args, {}, tool, { requestRender() {} }, process.cwd());
 		row.markExecutionStarted(); row.setArgsComplete();
-		const controller = new AbortController();
-		let updates = 0;
-		const first = await tool.execute("owner", args, controller.signal, (value: any) => { updates++; row.updateResult(value, true); }, h.ctx);
-		row.updateResult(first, false);
-		const read = () => stripTerminalSequences(row.render(160).join("\n"));
-		const payload = JSON.parse(first.content[0].text);
-		assert.equal(payload.status, "waiting_for_reply");
-		assert.match(read(), /Q: 继续吗/);
-		assert.doesNotMatch(read(), /Q[1-9] ·|等待回答|已回答|Batch |已结束|占用槽位与路径锁/);
-		assert.doesNotMatch(read(), new RegExp(questionId), "collapsed worker question labels stay concise");
-		assert.doesNotMatch(read(), /password-fixture-hidden/);
-		const atReturn = updates;
-		controller.abort();
-		await until(() => /✓/.test(read()));
-		assert.equal(updates, atReturn, "no late onUpdate used to update a finished tool");
-		const beforeReply = paints;
-		const q = payload.questions[0];
-		let replyReturned = false;
-		const reply = tool.execute("reply", { batchId: payload.batchId, answers: [{ taskId: q.taskId, questionId: q.id, answer: `选择 B ${secret("token")}` }] }).then((result: any) => { replyReturned = true; return result; });
-		await until(() => /A: 选择 B/.test(read()));
-		assert.ok(paints > beforeReply, "ToolRenderContext.invalidate requested the actual TUI redraw");
-		assert.doesNotMatch(read(), /Q[1-9] ·|等待回答|已回答|执行中|等待执行/);
-		assert.doesNotMatch(read(), /等待主 Agent|token-fixture-hidden/);
-		assert.equal(replyReturned, false, "answer invocation waits while the original card updates");
+		let details: any;
+		const first = tool.execute("owner", args, undefined, (value: any) => { details = value.details; row.updateResult(value, true); }, h.ctx);
+		await until(() => ready);
+		assert.match(stripTerminalSequences(row.render(160).join("\n")), /live task/);
+		assert.equal(details.tasks[0].status, "running");
+		assert.ok(h.usage.length > 0);
+		const invalid = { batchId: details.batchId, cancel: false };
+		await assert.rejects(tool.execute("invalid", invalid, undefined, undefined, h.ctx), /参数错误/);
+		await until(() => /控制错误/.test(stripTerminalSequences(row.render(160).join("\n"))));
+		const hidden = new Component("worker", "invalid", invalid, {}, tool, { requestRender() {} }, process.cwd());
+		hidden.updateResult({ content: [{ type: "text", text: "参数错误" }], isError: true }, false);
+		assert.deepEqual(hidden.render(80), []);
 		release();
-		assert.equal(JSON.parse((await reply).content[0].text).finished, true);
-		await until(() => /✓/.test(read()));
-		row.setExpanded(true);
-		assert.match(read(), /Q: 继续吗/);
-		assert.match(read(), /A: 选择 B/);
-		assert.doesNotMatch(read(), new RegExp(questionId), "question IDs are not shown in the card");
-		assert.equal(first.details.questions[0].status, "waiting", "serialized initial snapshot is not mutated");
-		await assert.rejects(tool.execute("duplicate", { batchId: payload.batchId, answers: [{ taskId: q.taskId, questionId: q.id, answer: "再次" }] }), /重复/);
-		const completed = JSON.parse((await tool.execute("wait", { batchId: payload.batchId })).content[0].text);
-		assert.equal(completed.finished, true);
-		assert.deepEqual(completed.result.results[0].observed_changed_files, ["observed.ts"]);
-		assert.equal(completed.result.results[0].execution.usage.input, 20);
-		assert.ok(h.usage.some((item) => item.taskId === "owner:0" && item.input === 20));
-		await h.handlers.get("session_shutdown")({ reason: "reload" });
-		await h.handlers.get("session_start")({}, h.ctx);
-		row.invalidate();
-		assert.doesNotMatch(read(), /Batch |历史快照|已结束/);
-		assert.match(read(), /选择 B/);
-		const historical = new Component("worker", "owner", args, {}, tool, { requestRender() { paints++; } }, process.cwd());
-		historical.updateResult(first, false);
-		assert.doesNotMatch(stripTerminalSequences(historical.render(160).join("\n")), /Batch |历史快照|已结束/);
-		await assert.rejects(tool.execute("stale", { batchId: payload.batchId }), /过期/);
-	} finally {
-		release();
-		await h.handlers.get("session_shutdown")({ reason: "quit" });
-	}
+		const result = await first; row.updateResult(result, false);
+		assert.equal(result.details.tasks[0].status, "completed");
+		const before = structuredClone(result.details);
+		for (const expanded of [false, true]) {
+			const render = (value: any) => tool.renderResult(value, { expanded, isPartial: false }, theme).render(160);
+			const normal = render(result);
+			assert.ok(normal.length > 0);
+			assert.deepEqual(render({ details: result.details, get content() { throw new Error("UI must not read JSON content"); } }), normal);
+		}
+		assert.deepEqual(result.details, before, "rendering must not mutate details");
+		const continued = await tool.execute("continue", { batchId: details.batchId }, undefined, undefined, h.ctx);
+		const followup = new Component("worker", "continue", { batchId: details.batchId }, {}, tool, { requestRender() {} }, process.cwd());
+		followup.updateResult(continued, false);
+		assert.deepEqual(followup.render(80), []);
+		assert.ok(h.branch.length > 0, "progress and completion snapshots persist");
+	} finally { release(); await h.handlers.get("session_shutdown")({}); }
 });
 
-test("no 30-second polling return; a later question returns and its expiry updates the original row", async (t) => {
-	t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-	let allowQuestion!: () => void;
-	const gate = new Promise<void>((resolve) => { allowQuestion = resolve; });
-	let started!: () => void;
-	const running = new Promise<void>((resolve) => { started = resolve; });
-	const h = harness(async (_task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-		started();
-		await gate;
-		await ask!({ id: "later", question: "工具返回后的问题", timeoutMs: 1_000 }, signal!);
-		return complete;
-	});
-	await h.handlers.get("session_start")({}, h.ctx);
-	try {
-		const tool = h.tools.get("worker");
-		let updates = 0;
-		let returned = false;
-		let current: any;
-		let rendered = "";
-		const context = { state: {}, invalidate() { rendered = tool.renderResult(current, { expanded: true, isPartial: !returned }, theme, context).render(160).join("\n"); } };
-		const execution = tool.execute("timed", { task: { mode: "scout", objective: "slow" } }, undefined, (value: any) => { updates++; current = value; context.invalidate(); }, h.ctx).then((result: any) => { returned = true; current = result; return result; });
-		await running;
-		t.mock.timers.tick(60_000);
-		await Promise.resolve();
-		assert.equal(returned, false, "no question or completion: still waiting beyond 30 seconds");
-		assert.match(rendered, /slow/);
-		assert.doesNotMatch(rendered, /执行中|等待执行/);
-		allowQuestion();
-		const result = await execution;
-		assert.equal(JSON.parse(result.content[0].text).status, "waiting_for_reply");
-		assert.equal(result.details.questions[0].status, "waiting");
-		context.invalidate();
-		t.mock.timers.tick(50);
-		assert.match(rendered, /工具返回后的问题/);
-		assert.match(rendered, /Q: 工具返回后的问题/);
-		t.mock.timers.tick(1_000);
-		await tool.execute("wait", { batchId: result.details.batchId });
-		t.mock.timers.tick(50);
-		assert.match(rendered, /Q: 工具返回后的问题/);
-		assert.doesNotMatch(rendered, /已过期|等待回答/);
-		assert.match(rendered, /✗/);
-		assert.doesNotMatch(rendered, /已结束|执行中/);
-		assert.equal(updates, 1, "only the initial card snapshot uses onUpdate; later changes use live rendering");
-		assert.equal(result.details.questions[0].status, "waiting", "initial snapshot remains immutable");
-	} finally {
-		allowQuestion();
-		await h.handlers.get("session_shutdown")({});
-		t.mock.timers.reset();
-	}
-});
-
-test("switch/tree/shutdown cancels pending questions, freezes old rows and rejects stale replies", async () => {
-	const h = harness(async (_task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-		await ask!({ id: "pending", question: "尚未回答", timeoutMs: 10_000 }, signal!);
-		return complete;
-	});
-	await h.handlers.get("session_start")({}, h.ctx);
-	try {
-		const tool = h.tools.get("worker");
-		const result = await tool.execute("old", { task: { mode: "scout", objective: "old session" } }, undefined, undefined, h.ctx);
-		const context = { state: {}, invalidate() {} };
-		tool.renderResult(result, { expanded: true, isPartial: false }, theme, context);
-		await h.handlers.get("session_tree")({}, h.ctx);
-		const frozen = tool.renderResult(result, { expanded: true, isPartial: false }, theme, context).render(160).join("\n");
-		assert.match(frozen, /Q: 尚未回答/);
-		assert.doesNotMatch(frozen, /已取消/);
-		assert.doesNotMatch(frozen, /历史快照|已结束|Batch |执行中/);
-		const payload = JSON.parse(result.content[0].text);
-		await assert.rejects(tool.execute("late", { batchId: payload.batchId, answers: [{ taskId: payload.questions[0].taskId, questionId: "pending", answer: "late" }] }), /过期/);
-		await assert.rejects(tool.execute("stale", { batchId: payload.batchId }), /过期/);
-	} finally {
-		await h.handlers.get("session_shutdown")({});
-		await h.handlers.get("session_shutdown")({});
-	}
-});
-
-test("cards show all complete Q&A by default with two-space labels and narrow-width wrapping", async () => {
+test("snapshots are detached and redact secrets while preserving routing IDs outside compression", async () => {
 	const runtime = new WorkerRuntime(() => false);
-	const batch = start(runtime, [task("中文任务.ts")], async () => complete);
+	const batch = start(runtime, [task("a.ts")], async () => ({ status: "completed", summary: ["long".repeat(5_000)] }));
+	batch.maxOutputBytes = 256;
+	batch.ui.originToolCallId = "origin-" + "a".repeat(100);
+	batch.ui.controlErrors = [{ toolCallId: "control-" + "b".repeat(100), message: secret("password") }];
 	await runtime.wait(batch.id);
-	const longQuestion = `中文问题\n${"需要保留的完整上下文".repeat(22)}问题末尾`;
-	const longAnswer = `${"回答细节".repeat(45)}答案末尾`;
-	batch.questions = Array.from({ length: 5 }, (_, i) => ({
-		id: `q-${i}`, batchId: batch.id, taskId: batch.tasks[0].id, status: i === 4 ? "waiting" : "answered", question: i === 0 ? longQuestion : `问题 ${i}`, answer: i === 4 ? undefined : i === 0 ? longAnswer : `回答 ${i}`, askedAt: 1, expiresAt: 2, timeoutMs: 1,
-	}));
-	const details = batchResponse(batch).details;
-	const collapsed = stripTerminalSequences(renderWorkerDetails(details, theme).render(160).join("\n"));
-	assert.match(collapsed, /问题末尾/);
-	assert.match(collapsed, /答案末尾/);
-	assert.match(collapsed, /  Q: 问题 1/);
-	assert.match(collapsed, /  A: 回答 1/);
-	assert.match(collapsed, /  Q: 问题 3[\s\S]*  Q: 问题 4/);
-	assert.doesNotMatch(collapsed, /q-0|Q[1-9] ·|已回答|等待回答|展开工具查看完整问答/);
-	assert.match(collapsed, /\n  Q: 中文问题/);
-	assert.match(collapsed, /Q: 中文问题\s*\n  需要保留/);
-	assert.match(collapsed, /\n  A: 回答细节/);
-	assert.doesNotMatch(collapsed, /  A: undefined/);
-	for (const width of [0, 1, 2, 20, 40, 80, 120]) {
-		for (const expanded of [false, true]) assert.ok(renderWorkerDetails(details, theme, { expanded }).render(width).every((line) => visibleWidth(line) <= width));
-	}
+	const response = batchResponse(batch);
+	const payload = JSON.parse(response.content[0].text);
+	assert.equal(payload.result.truncated, true);
+	assert.equal(payload.batchId, batch.id);
+	assert.equal(payload.tasks[0].taskId, batch.tasks[0].id);
+	assert.equal(response.details.originToolCallId, batch.ui.originToolCallId);
+	assert.equal(response.details.controlErrors![0].toolCallId, batch.ui.controlErrors[0].toolCallId);
+	assert.doesNotMatch(JSON.stringify(response), /password-fixture-hidden/);
+	batch.ui.tasks[0].objective = "changed later";
+	assert.notEqual(response.details.tasks[0].objective, "changed later");
 	await runtime.dispose();
 });
 
@@ -261,37 +149,6 @@ test("static historical cards freeze elapsed time and rebuild with the current t
 	await runtime.dispose();
 });
 
-test("valid long IDs survive compression while question/context/answer secrets are redacted in snapshots", async () => {
-	const runtime = new WorkerRuntime(() => false);
-	const batch = start(runtime, [task("a.ts")], async (running) => {
-		await runtime.ask(running, { id: questionId, question: secret("password"), context: secret("token"), timeoutMs: 1_000 } as any, running.controller.signal);
-		return { status: "completed", summary: ["long".repeat(5_000)], observed_changed_files: ["a.ts"] };
-	});
-	batch.maxOutputBytes = 256;
-	batch.ui.originToolCallId = "origin-" + "a".repeat(100);
-	batch.ui.controlErrors = [{ toolCallId: "control-" + "b".repeat(100), message: secret("password") }];
-	await runtime.wait(batch.id);
-	const waiting = batchResponse(batch);
-	const pending = JSON.parse(waiting.content[0].text);
-	assert.equal(pending.questions[0].id, questionId);
-	assert.equal(waiting.details.questions![0].id, questionId);
-	assert.equal(waiting.details.originToolCallId, batch.ui.originToolCallId);
-	assert.equal(waiting.details.controlErrors![0].toolCallId, batch.ui.controlErrors![0].toolCallId);
-	assert.equal(pending.batchId, batch.id);
-	assert.equal(pending.tasks[0].taskId, batch.tasks[0].id);
-	assert.doesNotMatch(JSON.stringify(waiting), /password-fixture-hidden|token-fixture-hidden/);
-	runtime.reply(batch.id, batch.tasks[0].id, questionId, `ok ${secret("credential")}`);
-	await runtime.wait(batch.id);
-	const response = batchResponse(batch);
-	const done = JSON.parse(response.content[0].text);
-	assert.equal(done.finished, true);
-	assert.equal(done.result.truncated, true);
-	assert.equal(done.history[0].id, questionId);
-	assert.equal(response.details.questions![0].id, questionId);
-	assert.doesNotMatch(JSON.stringify(response), /credential-fixture-hidden/);
-	assert.equal(waiting.details.questions![0].status, "waiting");
-	await runtime.dispose();
-});
 
 test("installed Pi and complete UI patch stack frame only visible Worker rows like ordinary tools", async () => {
 	const Component = await piToolComponent();
@@ -301,10 +158,7 @@ test("installed Pi and complete UI patch stack frame only visible Worker rows li
 	patchPaddedBackgroundHalfBlocks(); patchUserMessageHalfBlocks();
 	const root = dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")));
 	const { initTheme, theme: liveTheme } = await import(pathToFileURL(join(root, "modes/interactive/theme/theme.js")).href);
-	const h = harness(async (_task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-		await ask!({ id: "framed", question: "确认中文？", timeoutMs: 10_000 }, signal!);
-		return complete;
-	});
+	const h = harness(async () => complete);
 	await h.handlers.get("session_start")({}, h.ctx);
 	try {
 		const makeRow = (name: string, id: string, args: any, definition: any) => new Component(name, id, args, {}, definition, { requestRender() {} }, process.cwd());
@@ -325,7 +179,7 @@ test("installed Pi and complete UI patch stack frame only visible Worker rows li
 		owner.updateResult(initial, false);
 		ordinary.updateResult({ content: [{ type: "text", text: "done" }] }, false);
 		const drawn = owner.render(40);
-		assert.match(stripTerminalSequences(drawn.join("\n")), /确认中文/);
+		assert.match(stripTerminalSequences(drawn.join("\n")), /宽度中文ABC/);
 		assert.equal(bg(drawn[1]!), bg(ordinary.render(40)[1]!), "same active Pi tool background token");
 		assert.equal(boundaries(drawn).length, 2);
 		assert.equal(boundaries(ordinary.render(40)).length, 2);
@@ -339,15 +193,14 @@ test("installed Pi and complete UI patch stack frame only visible Worker rows li
 		assert.deepEqual(hidden.render(40), []);
 		hidden.updateArgs({ batchId: payload.batchId }); hidden.markExecutionStarted();
 		assert.deepEqual(hidden.render(40), []);
-		const followup = await workerTool.execute("follow-up", { batchId: payload.batchId, answers: [{ taskId: payload.questions[0].taskId, questionId: "framed", answer: "同意" }] });
+		const followup = await workerTool.execute("follow-up", { batchId: payload.batchId });
 		hidden.updateResult(followup, false); hidden.setExpanded(true);
-		assert.deepEqual(hidden.render(40), [], "answer and final result never acquire a shell");
+		assert.deepEqual(hidden.render(40), [], "continuation and final result never acquire a shell");
 		const CoreContainer = Object.getPrototypeOf(Component.prototype).constructor;
 		const adjacent = new CoreContainer(); adjacent.addChild(owner); adjacent.addChild(hidden); adjacent.addChild(ordinary);
 		const joined = adjacent.render(40);
 		assert.equal(boundaries(joined).length, 2, "adjacent framed tools share one top and bottom edge");
-		await until(() => /同意/.test(stripTerminalSequences(owner.render(40).join("\n"))));
-		assert.match(stripTerminalSequences(adjacent.render(40).join("\n")), /同意/, "the original card receives the live reply");
+		assert.match(stripTerminalSequences(adjacent.render(40).join("\n")), /宽度中文ABC/);
 		const unknown = makeRow("worker", "unknown", { batchId: "unrecognized" }, workerTool);
 		unknown.updateResult({ content: [{ type: "text", text: "unknown failure" }], isError: true }, false);
 		assert.match(stripTerminalSequences(unknown.render(40).join("\n")), /unknown failure/);
@@ -365,161 +218,21 @@ test("installed Pi and complete UI patch stack frame only visible Worker rows li
 	}
 });
 
-const assistantCall = (id: string, args: unknown) => ({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name: "worker", arguments: args }] } });
-const toolResult = (id: string, result: unknown) => ({ type: "message", message: { role: "toolResult", toolName: "worker", toolCallId: id, ...result as object } });
 
-test("installed Pi self shell: partial, continue, answer and cancel rows stay exactly zero lines; control errors use original card", async () => {
-	const h = harness(async (_task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-		await ask!({ id: "one-card", question: "continue?", timeoutMs: 10_000 }, signal!);
-		return complete;
-	});
+test("history reload merges only the selected branch snapshot and rejects stale live control", async () => {
+	const h = harness(async () => complete);
 	await h.handlers.get("session_start")({}, h.ctx);
 	try {
 		const tool = h.tools.get("worker");
-		const Component = await piToolComponent();
-		const makeRow = (id: string, args: any) => new Component("worker", id, args, {}, tool, { requestRender() {} }, process.cwd());
-		const args = { task: { mode: "scout", objective: "one card" } };
-		const row = makeRow("origin", args);
-		const first = await tool.execute("origin", args, undefined, (r: any) => row.updateResult(r, true), h.ctx);
-		row.updateResult(first, false);
-		const text = () => stripTerminalSequences(row.render(160).join("\n"));
-		const batchId = first.details.batchId;
-		const q = first.details.questions[0];
-		assert.match(text(), /continue\?/);
-		const partial = makeRow("partial", {});
-		assert.deepEqual(partial.render(160), []);
-		partial.markExecutionStarted(); partial.setExpanded(true); partial.invalidate();
-		assert.deepEqual(partial.render(20), []);
-		for (const [id, input] of [["wait", { batchId }], ["answer", { batchId, answers: [{ taskId: q.taskId, questionId: q.id, answer: "yes" }] }], ["cancel", { batchId, cancel: true }]] as const) {
-			const next = makeRow(id, {});
-			assert.deepEqual(next.render(160), []);
-			next.updateArgs(input); next.markExecutionStarted();
-			assert.deepEqual(next.render(160), []);
-			const result = await tool.execute(id, input);
-			next.updateResult(result, false);
-			for (const width of [1, 20, 160]) for (const expanded of [true, false]) {
-				next.setExpanded(expanded); next.invalidate(); assert.deepEqual(next.render(width), []);
-			}
-		}
-		await assert.rejects(tool.execute("bad-answer", { batchId, answers: [{ taskId: q.taskId, questionId: q.id, answer: "again" }] }), /重复/);
-		assert.match(text(), /控制错误.*重复/);
-		const knownError = makeRow("bad-answer", { batchId });
-		knownError.updateResult({ content: [{ type: "text", text: "duplicate" }], isError: true }, false);
-		assert.deepEqual(knownError.render(160), []);
-		const unknown = makeRow("unknown", { batchId: "missing" });
-		unknown.updateResult({ content: [{ type: "text", text: "unknown batch" }], isError: true }, false);
-		assert.match(stripTerminalSequences(unknown.render(160).join("\n")), /unknown batch/);
-		const unowned = makeRow("unowned", { batchId });
-		unowned.updateResult({ content: [{ type: "text", text: "external error" }], isError: true }, false);
-		assert.match(stripTerminalSequences(unowned.render(160).join("\n")), /external error/);
-	} finally { await h.handlers.get("session_shutdown")({}); }
-});
-
-test("reload beforeSessionStart and real Pi renderBeforeBind hydrate initial rows without rebinding old sessions", async () => {
-	let executions = 0;
-	const run: typeof executeTask = async (_task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-		executions++;
-		await ask!({ id: "reload-question", question: "reload Q", timeoutMs: 10_000 }, signal!);
-		return complete;
-	};
-	const original = harness(run);
-	await original.handlers.get("session_start")({}, original.ctx);
-	const sessions = [original];
-	try {
-		const args = { task: { mode: "scout", objective: "reload origin" } };
-		original.branch.push(assistantCall("reload-origin", args));
-		const initial = await original.tools.get("worker").execute("reload-origin", args, undefined, undefined, original.ctx);
-		original.branch.push(toolResult("reload-origin", initial));
-		const fork = [...original.branch];
-		const q = initial.details.questions[0];
-		const answerArgs = { batchId: initial.details.batchId, answers: [{ taskId: q.taskId, questionId: q.id, answer: "latest persisted answer" }] };
-		original.branch.push(assistantCall("reload-answer", answerArgs));
-		const final = await original.tools.get("worker").execute("reload-answer", answerArgs);
-		original.branch.push(toolResult("reload-answer", final));
-		await original.handlers.get("session_shutdown")({});
-
-		const Component = await piToolComponent();
-		const restored = harness(run); sessions.push(restored); restored.branch.push(...original.branch);
-		const row = new Component("worker", "reload-origin", args, {}, restored.tools.get("worker"), { requestRender() {} }, process.cwd());
-		// reload's beforeSessionStart has already constructed and rendered this exact row.
-		row.updateResult(initial, false);
-		const text = (component: any) => stripTerminalSequences(component.render(160).join("\n"));
-		assert.match(text(row), /Q: reload Q/); assert.doesNotMatch(text(row), /latest persisted answer/);
-		await restored.handlers.get("session_start")({}, restored.ctx);
-		assert.match(text(row), /latest persisted answer/, "binding itself invalidates the startup row");
-		row.invalidate(); assert.match(text(row), /latest persisted answer/);
-		assert.doesNotMatch(text(row), /历史快照|Batch |已结束/);
-
-		// Session switch/fork gets a fresh extension owner; installed Pi renders it BEFORE binding.
-		const selected = harness(run); sessions.push(selected); selected.branch.push(...fork);
-		const root = dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")));
-		const { InteractiveMode } = await import(pathToFileURL(join(root, "modes/interactive/interactive-mode.js")).href);
-		let forkRow: any;
-		const surface = { session: {}, applyRuntimeSettings() {}, subscribeToAgent() {}, updateAvailableProviderCount() {}, updateEditorBorderColor() {}, updateTerminalTitle() {},
-			renderCurrentSessionState() {
-				forkRow = new Component("worker", "reload-origin", args, {}, selected.tools.get("worker"), { requestRender() {} }, process.cwd());
-				forkRow.updateResult(initial, false); assert.match(text(forkRow), /Q: reload Q/);
-			},
-			bindCurrentSessionExtensions: () => selected.handlers.get("session_start")({}, selected.ctx),
-		};
-		await restored.handlers.get("session_shutdown")({});
-		await InteractiveMode.prototype.rebindCurrentSession.call(surface, { renderBeforeBind: true });
-		forkRow.invalidate(); assert.match(text(forkRow), /Q: reload Q/); assert.doesNotMatch(text(forkRow), /latest persisted answer/);
-		row.invalidate(); assert.match(text(row), /latest persisted answer/, "old session row stays frozen");
-		// A real replacement on the SAME registered renderer also cannot adopt old rows.
-		restored.branch.splice(0, restored.branch.length, ...fork);
-		await restored.handlers.get("session_start")({}, restored.ctx);
-		row.invalidate(); assert.match(text(row), /latest persisted answer/);
-		assert.equal(executions, 1, "history never restarts a worker");
-	} finally { for (const h of sessions) await h.handlers.get("session_shutdown")({}); }
-});
-
-test("reload and tree use only branch snapshots, merge latest replies/errors into each origin and never resume work", async () => {
-	let executions = 0;
-	const h = harness(async (_task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-		executions++;
-		await ask!({ id: `history-${executions}`, question: "history Q", timeoutMs: 10_000 }, signal!);
-		return complete;
-	});
-	await h.handlers.get("session_start")({}, h.ctx);
-	try {
-		const tool = h.tools.get("worker"); const Component = await piToolComponent();
-		const starts: any[] = [];
-		for (let n = 0; n < 2; n++) {
-			const id = `origin-${n}`; const args = { task: { mode: "scout", objective: id } };
-			h.branch.push(assistantCall(id, args));
-			const initial = await tool.execute(id, args, undefined, undefined, h.ctx);
-			h.branch.push(toolResult(id, initial));
-			const fork = [...h.branch];
-			const q = initial.details.questions[0];
-			const answerArgs = { batchId: initial.details.batchId, answers: [{ taskId: q.taskId, questionId: q.id, answer: `reply-${n}` }] };
-			h.branch.push(assistantCall(`answer-${n}`, answerArgs));
-			const final = await tool.execute(`answer-${n}`, answerArgs);
-			h.branch.push(toolResult(`answer-${n}`, final));
-			h.branch.push(assistantCall(`error-${n}`, answerArgs));
-			await assert.rejects(tool.execute(`error-${n}`, answerArgs));
-			h.branch.push(toolResult(`error-${n}`, { isError: true, content: [{ type: "text", text: "重复回答" }] }));
-			starts.push({ id, args, initial, final, fork, answerArgs });
-		}
-		await h.handlers.get("session_tree")({}, h.ctx);
-		for (const [n, item] of starts.entries()) {
-			const row = new Component("worker", item.id, item.args, {}, tool, { requestRender() {} }, process.cwd());
-			// Historical loader does NOT call setArgsComplete().
-			row.updateResult(item.initial, false);
-			const text = stripTerminalSequences(row.render(160).join("\n"));
-			assert.match(text, new RegExp(`reply-${n}`)); assert.doesNotMatch(text, /历史快照|Batch |已结束/); assert.match(text, /控制错误/);
-			const followup = new Component("worker", `answer-${n}`, item.answerArgs, {}, tool, { requestRender() {} }, process.cwd());
-			followup.updateResult(item.final, false); assert.deepEqual(followup.render(160), []);
-		}
-		assert.equal(executions, 2);
-		h.branch.splice(0, h.branch.length, ...starts[0].fork);
-		await h.handlers.get("session_tree")({}, h.ctx);
-		const item = starts[0];
-		const isolated = new Component("worker", item.id, item.args, {}, tool, { requestRender() {} }, process.cwd());
-		isolated.updateResult(item.initial, false);
-		const text = stripTerminalSequences(isolated.render(160).join("\n"));
-		assert.match(text, /Q: history Q/); assert.doesNotMatch(text, /reply-0|控制错误/);
-		await assert.rejects(tool.execute("stale", { batchId: item.initial.details.batchId }), /过期/);
-		assert.equal(executions, 2);
+		const args = { task: { mode: "scout", objective: "branch snapshot" } };
+		const result = await tool.execute("origin", args, undefined, undefined, h.ctx);
+		const batchId = result.details.batchId;
+		await h.handlers.get("session_start")({}, h.ctx);
+		assert.match(tool.renderResult(result, {}, theme, { toolCallId: "origin", args, state: {}, invalidate() {} }).render(100).join("\n"), /branch snapshot/);
+		await assert.rejects(tool.execute("stale", { batchId }, undefined, undefined, h.ctx), /过期/);
+		const otherCtx = { ...h.ctx, sessionManager: { getBranch: () => [] } };
+		await h.handlers.get("session_start")({}, otherCtx);
+		const continuation = tool.renderResult({ content: [{ type: "text", text: "unrecognized" }] }, {}, theme, { toolCallId: "new", args: { batchId } });
+		assert.match(continuation.render(100).join("\n"), /unrecognized/);
 	} finally { await h.handlers.get("session_shutdown")({}); }
 });

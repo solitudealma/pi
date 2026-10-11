@@ -14,7 +14,7 @@ This is my personal [Pi Coding Agent](https://pi.dev) configuration: custom exte
 
 ## Local extension inventory
 
-Each row corresponds to current source under `extensions/`, excluding `node_modules`, tests, and helper modules. Pi discovers top-level `.ts` files and directories containing `index.ts`. `ask-parent.ts` is explicitly loaded only in Worker subprocesses. Do not load these internal entries a second time.
+Each row corresponds to current source under `extensions/`, excluding `node_modules`, tests, and helper modules. Pi discovers top-level `.ts` files and directories containing `index.ts`. Do not load internal entries a second time.
 
 | Extension / source | Purpose | Entry point | Configuration / activation |
 | --- | --- | --- | --- |
@@ -30,7 +30,6 @@ Each row corresponds to current source under `extensions/`, excluding `node_modu
 | [thinking-translation](extensions/thinking-translation/index.ts) | Add Chinese display translations to short Thinking without changing source sessions or model context | `/thinking_translation` toggle; automatically triggered by live streaming | `thinking-translation-settings.json`: `enabled`, `model`, `maxThinkingLength`; requests always use minimal reasoning; local cache at `~/.pi/thinking-translations/` |
 | [ui](extensions/ui/index.ts) | Custom header, editor, footer, tool cards, and main-agent + Worker progress/usage | Automatic TUI rendering, not a user command | No separate configuration; footer reads `codex-fast.json`; theme/display settings in `settings.json`, shortcuts in `keybindings.json` |
 | [worker](extensions/worker/index.ts) | Bounded subprocess tasks, parallel scheduling, and progress cards | Agent tool `worker`; `/worker_settings` | `worker-settings.json`: required three-tier models/Thinking, concurrency, automatic delegation, timeout, and output limit; in subprocesses, this entry installs only the write guard, not nested delegation |
-| [Worker / ask-parent](extensions/worker/ask-parent.ts) | Let a Worker ask the real main agent for a decision | **Internal bridge tool `ask_parent`, not a user command** | Explicitly loaded by Worker; requires subprocess depth and the fd 3 control channel; default answer timeout 120 seconds, configurable to 1–600 seconds |
 
 The old local `context`, `usage`, and `fast` extensions have been removed; their `/context`, `/usage`, and `/fast` commands are no longer provided by these extensions. Context usage appears in the footer; Fast settings use `/codex-fast`. `rolling-compact` and its configuration have been removed, and `/roll-compact` is no longer provided; context management uses SoL-Pi again. External packages are not part of this local inventory.
 
@@ -96,9 +95,9 @@ These are source-code defaults, not copied local model or user settings; local c
 
 ## Worker
 
-`worker` delegates bounded, independently verifiable subtasks to separate Pi subprocesses. Workers do not persist sessions or automatically load Skills or Context Files, and may not create or call other Workers. The main agent decomposes the work, answers questions, inspects the actual diff, verifies it, and makes the final acceptance decision.
+`worker` delegates bounded, independently verifiable subtasks to separate Pi subprocesses. The main model defaults to `fork` (an isolated snapshot of the current active branch), including when the mode is omitted, and uses `new` (fresh history) only when little context handoff is needed. Child sessions are temporary and do not automatically load Skills or Context Files, and may not create or call other Workers. The main agent decomposes the work, handles blockers, inspects the actual diff, verifies it, and makes the final acceptance decision.
 
-Starting, answering, continuing to wait, and cancelling all use the single `worker` tool. Each main session allows only one unfinished batch; put parallel tasks in the `tasks` array of a single call. Batch results retain input order and each task may complete, be blocked, or fail independently.
+Starting, continuing to wait, and cancelling all use the single `worker` tool. Each main session allows only one unfinished batch; put parallel tasks in the `tasks` array of a single call. Batch results retain input order and each task may complete, be blocked, or fail independently.
 
 The summary and `changed_files` report Worker claims and workspace snapshot information; they do not replace the main agent's inspection of the actual diff.
 
@@ -114,25 +113,21 @@ Five modes are supported: `scout` for read-only investigation, `implement` for i
 
 Models and Thinking for every tier are read from local `worker-settings.json`; `fast`, `normal`, and `deep` must each specify a valid model. Missing/unavailable models produce errors, never guessed routes or silent downgrades. Loading legacy configuration removes and persists the obsolete top-level `max` entry. General source defaults are concurrency 3, automatic delegation enabled, 15-minute task timeout, and 64 KiB output limit. `/worker_settings` interactively edits these settings and per-tier models/Thinking; choosing “Save and exit” applies them immediately to subsequent tasks. When automatic delegation is off, explicit starts require `manual: true`.
 
-### Questions and user confirmation
+### Blockers and user decisions
 
-Workers can use `ask_parent` to ask the real main agent questions; no extra coordinator model or main-session fork is used. `worker` returns when a question needs an answer, otherwise waiting for the whole batch to finish without periodic polling returns. The main agent submits one or more answers through the same tool and continues waiting; independent tasks can keep running. Workers awaiting answers retain their concurrency slots and path locks.
-
-When user judgment is needed, the main agent treats `ask_question` as a normal quick call, then explicitly relays the answer using the original question ID; user choices are never forwarded automatically. **Ordinary task and question timeouts keep running, including user confirmation and questionnaire queueing**; no extra time is reserved or added. Independent work continues. Late answers are rejected and cannot revive expired tasks or questions. Concurrent questionnaires display in order; cancellation and session shutdown clean up the UI and queue.
-
-Cancelling or leaving a confirmation is not consent. Answers cannot expand the original task's permissions; broader scope requires cancellation, cleanup, and a new task. If a decision affects dangerous operations already running, cancel the relevant batch first: human waiting does not suspend arbitrary running tools.
+`worker` supports only start, wait for completion, and cancel; there is no interactive child-to-parent Q&A. A task missing information, decisions, or permission returns `blocked` and releases its resources. The main agent handles blockers, uses `ask_question` for user decisions if needed, and starts a new bounded task. Cancellation is not consent; scope expansion requires cancelling affected batches and awaiting cleanup. User interaction does not extend task deadlines.
 
 ### Parallelism, progress, and acceptance
 
-Batch tasks are scheduled up to the concurrency limit: read-only tasks may run in parallel; read/write tasks conflict and must run serially; writers run in parallel only when `cwd` and all declared write paths can be resolved and proven disjoint. Unprovable independence is treated as a conflict; scheduling does not promise independent Git worktrees. Sessions in the same process own separate children, slots, and cleanup. Separate Pi windows have isolated control channels but may still share a worktree; path locks do not span windows.
+Batch tasks are scheduled up to the concurrency limit: read-only tasks may run in parallel; read/write tasks conflict and must run serially; writers run in parallel only when `cwd` and all declared write paths can be resolved and proven disjoint. Unprovable independence is treated as a conflict; scheduling does not promise independent Git worktrees. Sessions in the same process own separate children, slots, and cleanup. Separate Pi windows are independent but may still share a worktree; path locks do not span windows.
 
-Each batch uses only its original Worker card, styled consistently with the tools in `extensions/ui/`. Follow-up answer, wait, and cancel calls remain in the model transcript but add no visible cards. Task status, tool activity, tier, turns, usage, elapsed time, completion summaries, and all per-task Q&A display in full on the original card by default. Batch-ID summary lines and routine execution-slot waiting notices are omitted; errors and timeout diagnostics remain visible.
+Each batch uses only its original Worker card, styled consistently with the tools in `extensions/ui/`. Follow-up wait and cancel calls remain in the model transcript but add no visible cards. Task status, tool activity, tier, turns, usage, elapsed time, completion summaries display in full on the original card by default. Batch-ID summary lines and routine execution-slot waiting notices are omitted; errors and timeout diagnostics remain visible.
 
 Progress is truncated and filtered for common sensitive fields; this does not guarantee complete redaction. Cancellation, timeout, or output overflow triggers an attempt to terminate the subprocess; cancel calls wait for cleanup. Failures go to the main agent for handling and are not automatically retried. Reloading, switching sessions, or navigating the session tree cleans up background tasks. Historical cards use the latest persisted snapshot on the current branch and never resume subprocesses.
 
 `cwd` must remain inside the main working directory. `allowedPaths`/`forbiddenPaths` are checked only before `edit` and `write` tool calls. They are not a shell or filesystem sandbox and do not constrain `bash` or other extension tools; do not treat them as an isolation boundary. The main agent must inspect actual changes, pre-existing worktree modifications, verification evidence, and task scope before accepting the result.
 
-Unexpected disconnection during a pending question fails and cleans up the worker, even if it catches the IPC error and claims success. There is no automatic reconnect or redispatch. Failure diagnostics retain termination sources and necessary process identifiers; they cannot establish why historical runs were cancelled. Custom SDK hosts must emit and await `session_shutdown`: bare `AgentSession.dispose()` in Pi 0.87.1 does not emit it. See the [Worker extension documentation](extensions/worker/README.md) for protocol details, host limitations, and test commands.
+Failure diagnostics retain termination sources and necessary process identifiers; they cannot establish why historical runs were cancelled. Custom SDK hosts must emit and await `session_shutdown`: bare `AgentSession.dispose()` in Pi 0.87.1 does not emit it. See the [Worker extension documentation](extensions/worker/README.md) for lifecycle details, host limitations, and test commands.
 
 ## Configuration and security
 

@@ -3,7 +3,7 @@ import test from "node:test";
 import { Theme } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import type { WorkerUiActivity, WorkerUiDetails } from "./types.ts";
-import { createThinkingActivityRecorder, renderWorkerDetails, uiActivityLine, workerUsageText } from "./ui.ts";
+import { compactWorkerResult, serializePayload, createThinkingActivityRecorder, renderWorkerDetails, uiActivityLine, workerUsageText } from "./ui.ts";
 
 test("worker usage groups input and output without a dot separator", () => {
 	assert.equal(
@@ -62,38 +62,6 @@ test("truncated tool lines preserve an enclosing ANSI background", () => {
 	assert.match(framed, /…\x1b\[39m {10}\x1b\[49m$/);
 });
 
-test("questions and answers stay inside the matching worker block without duplication", () => {
-	const batchId = "batch-long-id";
-	const task = (index: number) => ({
-		index, mode: "scout" as const, objective: `worker-${index + 1}`, status: "running" as const,
-		requestedPreset: "fast" as const, attempt: 0, phase: "运行", activities: [], toolCalls: 0,
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0, turns: 0 },
-	});
-	const details: WorkerUiDetails = {
-		kind: "worker-ui", batchId, startedAt: 1, limit: 3, total: 3, completed: 0,
-		tasks: [task(0), task(1), task(2)],
-		questions: [
-			{ id: "question-1", batchId, taskId: `${batchId}:1`, status: "answered", question: "first question", answer: "first answer", askedAt: 1, expiresAt: 10, timeoutMs: 9 },
-			{ id: "question-2", batchId, taskId: `${batchId}:2`, status: "waiting", question: "second question", askedAt: 1, expiresAt: 10, timeoutMs: 9 },
-			{ id: "question-3", batchId, taskId: `${batchId}:3`, status: "answered", question: "third question", answer: "third answer", askedAt: 1, expiresAt: 10, timeoutMs: 9 },
-		],
-	};
-	const theme = { fg: (_: string, text: string) => text } as Theme;
-	const rendered = renderWorkerDetails(details, theme).render(1_000).join("\n");
-	const blocks = rendered.split("─".repeat(24));
-	assert.equal(blocks.length, 3);
-	assert.match(blocks[0]!, /  Q: first question[\s\S]*  A: first answer/);
-	assert.doesNotMatch(blocks[0]!, /second question|third question/);
-	assert.match(blocks[1]!, /  Q: second question/);
-	assert.doesNotMatch(blocks[1]!, /  A:/, "unanswered questions do not get a fabricated answer");
-	assert.match(blocks[2]!, /  Q: third question[\s\S]*  A: third answer/);
-	assert.equal((rendered.match(/first answer/g) ?? []).length, 1);
-	assert.equal((rendered.match(/third answer/g) ?? []).length, 1);
-	assert.doesNotMatch(rendered, /question-1|question-2|question-3|Q[1-9]\s*·|已回答|等待回答|展开工具查看完整问答/);
-	assert.match(rendered, /\n  Q: first question/);
-	assert.match(rendered, /\n  A: first answer/);
-});
-
 test("worker details omit batch and scheduling rows while retaining task and timeout diagnostics", () => {
 	const batchId = "batch-render-test";
 	const details: WorkerUiDetails = {
@@ -145,4 +113,68 @@ test("worker details display the complete objective", () => {
 
 	assert.match(rendered, /目标结束/);
 	assert.ok(rendered.includes(`<toolOutput>${objective}</toolOutput>`));
+});
+
+test("result compaction preserves every field's standard and minimal limits", () => {
+	const limits = {
+		summary: [4, 2], changed_files: [50, 20], validation: [8, 3], acceptance: [8, 3],
+		findings: [10, 4], risks: [6, 3], out_of_scope: [4, 2], recommended_next_action: [4, 2],
+	};
+	const source = {
+		status: "completed", extra: "omitted",
+		...Object.fromEntries(Object.keys(limits).map((key) => [key, Array.from({ length: 60 }, (_, i) => `${key}:${i}`)])),
+	};
+	const original = structuredClone(source);
+	for (const [i, level] of (["standard", "minimal"] as const).entries()) {
+		const result = compactWorkerResult(source, level);
+		assert.deepEqual(Object.keys(result), ["status", "execution", "failure", ...Object.keys(limits)]);
+		assert.equal(result.status, "completed");
+		for (const [key, counts] of Object.entries(limits)) {
+			assert.deepEqual(result[key], (source as any)[key].slice(0, counts[i]), `${level}.${key}`);
+		}
+		for (const malformed of [undefined, null, "text", {}, 42]) {
+			const compact = compactWorkerResult(Object.fromEntries(Object.keys(limits).map((key) => [key, malformed])), level);
+			for (const key of Object.keys(limits)) assert.deepEqual(compact[key], []);
+		}
+	}
+	assert.deepEqual(source, original);
+});
+
+test("both compaction levels preserve fixed execution diagnostics through serialization", () => {
+	const execution = {
+		resolved_preset: "fast", actual_model_id: "fixture/local", actual_thinking: "high", attempt: 1,
+		usage: { input: 42, output: 17, cacheRead: 0, cacheWrite: 0, turns: 1 }, exit_code: 1,
+		timed_out: false, cancelled: true,
+		termination: { stage: "process", code: "session_shutdown", source: "session_shutdown", parentPid: 1, workerPid: 2, ownerId: "fixture" },
+		termination_source: "session_shutdown", warnings: ["configuration migrated"],
+	};
+	const source = { status: "failed", execution, summary: Array(20).fill("诊断内容".repeat(100)) };
+	const before = structuredClone(source);
+	for (const level of ["standard", "minimal"] as const) {
+		const compact = compactWorkerResult(source, level);
+		assert.deepEqual(compact.execution, execution, `${level}: fixed keys must not be truncated`);
+		const expected = { status: "failed", ...(level === "minimal" ? { truncated: true } : {}), results: [compact] };
+		const budget = Buffer.byteLength(JSON.stringify(expected));
+		const serialized = serializePayload({ status: "failed", results: [compactWorkerResult(source)] }, budget);
+		assert.deepEqual(JSON.parse(serialized.text), JSON.parse(JSON.stringify(expected)), `${level}: preserve diagnostics at the output boundary`);
+		assert.equal(Buffer.byteLength(serialized.text), budget);
+		const bounded = compactWorkerResult({ execution: {
+			warnings: Array(20).fill("长".repeat(500)),
+			termination: Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`key${i}`, i])),
+		} }, level).execution;
+		assert.equal(bounded.warnings.length, level === "standard" ? 10 : 5);
+		assert.ok(bounded.warnings.every((warning: string) => Buffer.byteLength(warning) <= (level === "standard" ? 768 : 256)));
+		assert.equal(Object.keys(bounded.termination).length, level === "standard" ? 10 : 8);
+	}
+	assert.deepEqual(source, before, "compaction must not mutate the source");
+});
+
+test("serialization measures compact UTF-8 JSON, not indentation overhead", () => {
+	const payload = { status: "completed", summary: ["保留空格  和换行\n引号：\"fixture\""], extra: { nested: Array(40).fill("保留") } };
+	const text = JSON.stringify(payload);
+	const budget = Buffer.byteLength(text);
+	assert.ok(Buffer.byteLength(JSON.stringify(payload, null, 2)) > budget);
+	const result = serializePayload(payload, budget);
+	assert.equal(result.payload, payload, "a fitting payload must not be compacted or lose unknown fields");
+	assert.equal(result.text, text);
 });

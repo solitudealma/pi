@@ -1,5 +1,5 @@
 // RPC-only model-free parent; spawned with Node IPC by isolation.test.ts.
-// runPiWorker re-invokes this script as the CLI, which dispatches to the fd3 child.
+// runPiWorker re-invokes this script as the CLI, which dispatches to a model-free child.
 import { dirname, join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -45,10 +45,6 @@ if (process.argv.includes("--mode")) {
 		}
 		if (op === "exit") { process.exit(0); }
 		if (op === "exit-hooks") { process.emit("exit", 0); return stats(); }
-		if (op === "socket-error") {
-			for (const owner of registry()) for (const child of owner.children) if (!message.pid || message.pid === child.pid) child.stdio[3].destroy(Object.assign(new Error("fixture error; no payload"), { code: "ECONNRESET" }));
-			return stats();
-		}
 		if (op === "abort") { signals.get(message.callId)?.abort(); return {}; }
 		const { extension, ctx } = sessions.get(name);
 		if (op === "shutdown" || op === "restart") {

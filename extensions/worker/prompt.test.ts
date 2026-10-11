@@ -1,0 +1,66 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import * as fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import { InputSchema, TOOL_DESCRIPTION } from "./index.ts";
+import { buildTaskPrompt, workerPromptBody } from "./prompt.ts";
+import type { WorkerTask } from "./types.ts";
+
+const contract = (prompt: string) => JSON.parse(prompt.split("\n")[1]);
+
+test("minimal task prompts omit empty context and host-owned route metadata", () => {
+	const prompt = buildTaskPrompt({ mode: "review", objective: "  review output  ", relevantFiles: [], context: "" }, null);
+	assert.deepEqual(contract(prompt), { mode: "review", objective: "review output", sessionMode: "fork", allowedPaths: [] });
+	assert.ok(Buffer.byteLength(prompt) <= 750, "bound repeated task boilerplate");
+	assert.match(prompt, /2-4 条具体结论/);
+	assert.match(prompt, /工作、验证及限制/);
+	assert.match(prompt, /不输出隐藏思考/);
+	assert.match(prompt, /历史上下文不扩大权限/);
+	const format = JSON.parse(prompt.split("\n").at(-1)!);
+	assert.equal(format.status, "completed | blocked | failed");
+	assert.ok(format.validation.length && format.acceptance.length);
+	assert.ok(!("changed_files" in format));
+});
+
+test("compact contracts preserve all supplied evidence, boundaries and relative existing changes", () => {
+	const task: WorkerTask = {
+		mode: "implement", objective: "Implement\nwith evidence", sessionMode: "fork", preset: "deep",
+		context: 'Keep  spaces and "quotes"\n二行', relevantFiles: ["/external/hint.ts"],
+		allowedPaths: ["src/**"], forbiddenPaths: ["src/private.ts"],
+		acceptanceCriteria: ["preserve API"], verificationCommands: ["npm test"], outputRequirements: ["report uncertainty"],
+	};
+	const prompt = buildTaskPrompt(task, {
+		cwd: "/repo/pkg", gitRoot: "/repo", statusPaths: new Set(["pkg/src/existing.ts", "other.ts"]), files: new Map(),
+	});
+	const { preset: _, ...expected } = task;
+	assert.deepEqual(contract(prompt), {
+		...expected, cwd: "/repo/pkg", preExistingUserChanges: ["src/existing.ts", "../other.ts"],
+	});
+});
+
+test("always-loaded tool metadata and worker system prompt stay within compact budgets", (t) => {
+	assert.ok(Buffer.byteLength(TOOL_DESCRIPTION) <= 1250);
+	assert.ok(Buffer.byteLength(JSON.stringify(InputSchema)) <= 3000);
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = fileURLToPath(new URL("../../", import.meta.url));
+	t.after(() => {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+	});
+	const body = workerPromptBody();
+	assert.ok(Buffer.byteLength(body) <= 2850);
+	assert.ok(!body.startsWith("---"));
+	for (const instruction of ["allowedPaths", "forbiddenPaths", "dir/**", "blocked" , "不覆盖或撤销已有修改", "不可逆命令"]) {
+		assert.ok(body.includes(instruction), instruction);
+	}
+});
+
+test("dispatch instructions require autonomous per-task session selection", () => {
+	assert.match(TOOL_DESCRIPTION, /Choose each task's sessionMode yourself/);
+	assert.match(TOOL_DESCRIPTION, /fork by default; use new only when little context handoff is needed/);
+	assert.match(TOOL_DESCRIPTION, /do not ask the user/);
+	const skill = fs.readFileSync(new URL("./SKILL.md", import.meta.url), "utf8");
+	assert.ok(Buffer.byteLength(skill) <= 5000);
+	assert.match(skill, /显式填写 `sessionMode`/);
+	assert.match(skill, /省略时默认 fork/);
+});

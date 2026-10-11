@@ -9,8 +9,7 @@ import { fileURLToPath } from "node:url";
 import { until } from "./fixtures/helpers.ts";
 
 const fixture = fileURLToPath(new URL("./fixtures/parent.mjs", import.meta.url));
-const task = (objective = "ask") => ({ task: { mode: "scout", objective } });
-const reply = (batch: any) => ({ batchId: batch.batchId, answers: batch.questions.map((q: any) => ({ taskId: q.taskId, questionId: q.id, answer: "authorized fixture answer" })) });
+const task = (objective = "hang") => ({ task: { mode: "scout", objective } });
 function workspace() {
 	const cwd = mkdtempSync(join(tmpdir(), "worker-isolation-"));
 	execFileSync("git", ["init", "--quiet", cwd]);
@@ -43,10 +42,10 @@ async function parent(cwd: string) {
 }
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-async function waitReady(p: Awaited<ReturnType<typeof parent>>) {
+async function waitReady(p: Awaited<ReturnType<typeof parent>>, count = 1) {
 	const deadline = Date.now() + 5_000;
 	while (Date.now() < deadline) {
-		if ((await p.call("stats")).owners.some((owner: any) => owner.ready)) return;
+		if ((await p.call("stats")).owners.filter((owner: any) => owner.ready).length >= count) return;
 		await delay(10);
 	}
 	throw new Error("fixture child did not become ready");
@@ -64,158 +63,80 @@ function assertReleased(stats: any) {
 	assert.ok(stats.runtimes.every((runtime: any) => runtime.active === 0 && runtime.queued === 0), "runtime active/path locks released");
 }
 
-// All tests use real installed-loader factories, executeTask, Git checks, process groups and fd3.
-test("two real extension instances have independent slots; idle shutdown and late abort cannot cancel the other", { timeout: 30_000 }, async (t) => {
+
+test("real loader instances isolate slots, shutdown and subsequent work", { timeout: 30_000 }, async (t) => {
 	const repo = workspace(); const p = await parent(repo.cwd);
 	try {
 		await p.call("load", { session: "a" }); await p.call("load", { session: "b" });
-		const first = await p.call("call", { session: "b", input: task() });
-		assert.equal(first.status, "waiting_for_reply");
+		const workB = p.call("call", { session: "b", input: task() });
+		await waitReady(p);
 		const before = await p.call("stats");
 		t.diagnostic(`Pi loader version: ${before.piVersion}`);
-		assert.equal(before.modules, 1, "same loader generation shares the process module");
+		assert.equal(before.modules, 1);
 		await p.call("shutdown", { session: "a" });
 		assert.deepEqual((await p.call("stats")).owners, before.owners);
-		await p.call("abort", { callId: "3" }); // the already-returned initial B invocation
-		const done = await p.call("call", { session: "b", input: reply(first) });
-		assert.equal(done.result.status, "completed");
-		assert.equal(done.history[0].status, "answered");
 		await p.call("restart", { session: "a" });
-		const [a, b] = await Promise.all([p.call("call", { session: "a", input: task() }), p.call("call", { session: "b", input: task() })]);
-		const stats = await p.call("stats");
-		assert.equal(stats.owners.length, 2);
-		assert.deepEqual(stats.owners.map((o: any) => o.slots), [1, 1], "each instance admits its own one-slot worker");
-		const shuttingDown = p.call("shutdown", { session: "a" });
-		const bDone = await p.call("call", { session: "b", input: reply(b) });
-		await shuttingDown;
-		assert.equal(bDone.result.status, "completed");
-		const cancelled = await p.call("call", { session: "b", input: task("done") });
-		assert.equal(cancelled.result.status, "completed");
-		assert.equal(a.finished, false);
-		assert.equal((await p.call("stats")).owners.length, 0, "empty owners are not retained by the global registry");
+		const workA = p.call("call", { session: "a", input: task() });
+		await waitReady(p, 2);
+		assert.equal((await p.call("stats")).owners.length, 2);
+		await p.call("shutdown", { session: "a" });
+		assert.equal((await workA).result.execution.termination.source, "session_shutdown");
+		assert.equal((await p.call("stats")).owners.length, 1);
+		await p.call("shutdown", { session: "b" });
+		assert.equal((await workB).result.execution.cancelled, true);
+		assertReleased(await p.call("stats"));
+		await p.call("restart", { session: "a" });
+		assert.equal((await p.call("call", { session: "a", input: task("done") })).result.status, "completed");
 	} finally { await p.dispose(); repo.dispose(); }
 });
 
-test("independent OS parents in the same cwd own independent PGIDs and fd3 channels", { timeout: 30_000 }, async () => {
-	const repo = workspace(); const a = await parent(repo.cwd); const b = await parent(repo.cwd);
+test("two OS parents in the same cwd isolate process groups and lifecycle", { timeout: 30_000 }, async () => {
+	const repo = workspace(); const a = await parent(repo.cwd), b = await parent(repo.cwd);
 	try {
-		await a.call("load"); await b.call("load");
-		const [qa, qb] = await Promise.all([a.call("call", { input: task() }), b.call("call", { input: task() })]);
-		const sa = await a.call("stats"), sb = await b.call("stats");
-		assert.notEqual(sa.parentPid, sb.parentPid);
-		const pa = sa.owners[0].pids[0], pb = sb.owners[0].pids[0];
-		assert.notEqual(pa, pb);
-		if (process.platform === "linux") {
-			for (const pid of [pa, pb]) {
-				const stat = readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1].split(" ");
-				assert.equal(Number(stat[2]), pid, "detached worker is its own process group");
-			}
-		}
+		await Promise.all([a.call("load"), b.call("load")]);
+		const workA = a.call("call", { input: task() }), workB = b.call("call", { input: task() });
+		await Promise.all([waitReady(a), waitReady(b)]);
+		const before = await b.call("stats");
 		await a.call("shutdown");
-		assert.equal((await a.call("stats")).owners.length, 0);
-		assert.deepEqual((await b.call("stats")).owners, sb.owners);
-		const done = await b.call("call", { input: reply(qb) });
-		assert.equal(done.result.status, "completed");
-		assert.equal(qa.finished, false);
-	} finally { await Promise.all([a.dispose(), b.dispose()]); repo.dispose(); }
+		assert.equal((await workA).result.execution.cancelled, true);
+		assert.deepEqual((await b.call("stats")).owners, before.owners);
+		await b.call("shutdown");
+		assert.equal((await workB).result.execution.cancelled, true);
+		assertReleased(await a.call("stats")); assertReleased(await b.call("stats"));
+	} finally { await a.dispose(); await b.dispose(); repo.dispose(); }
 });
 
-test("reload cache generations coexist; process exit hook kills both, is idempotent, and releases empty owners", { timeout: 30_000 }, async () => {
+test("exit fallback spans loader generations without cancelling fresh sessions on old shutdown", { timeout: 30_000 }, async () => {
 	const repo = workspace(); const p = await parent(repo.cwd);
 	try {
 		await p.call("load", { session: "old" });
-		const old = await p.call("call", { session: "old", input: task() });
+		const old = p.call("call", { session: "old", input: task() });
+		await waitReady(p);
 		await p.call("load", { session: "new", reload: true });
-		const current = await p.call("call", { session: "new", input: task() });
-		const stats = await p.call("stats");
-		assert.equal(stats.modules, 2, "clearExtensionCache produced two real process module generations");
-		assert.equal(stats.owners.length, 2);
-		await p.call("exit-hooks"); await p.call("exit-hooks");
-		for (const [session, batch] of [["old", old], ["new", current]] as const) {
-			// Ordinary continuation waits for cleanup once the transport closes.
-			let result = await p.call("call", { session, input: { batchId: batch.batchId } });
-			while (!result.finished) result = await p.call("call", { session, input: { batchId: batch.batchId } });
-			assert.equal(result.finished, true);
-			assert.equal(result.result.status, "failed");
-		}
-		assert.equal((await p.call("stats")).owners.length, 0);
+		const fresh = p.call("call", { session: "new", input: task() });
+		await waitReady(p, 2);
+		assert.equal((await p.call("stats")).modules, 2);
+		await p.call("shutdown", { session: "old" });
+		assert.equal((await old).result.execution.cancelled, true);
+		assert.equal((await p.call("stats")).owners.length, 1);
+		await p.call("exit-hooks");
+		assert.notEqual((await fresh).result.status, "completed");
+		assertReleased(await p.call("stats"));
 	} finally { await p.dispose(); repo.dispose(); }
 });
 
-test("real OS parent exit invokes the reload-safe fallback for every live generation", { timeout: 30_000 }, async () => {
-	const repo = workspace(); const p = await parent(repo.cwd);
-	const pids: number[] = [];
-	const running = (pid: number) => {
-		try {
-			process.kill(pid, 0);
-			if (process.platform === "linux") return !/^[ZX] /.test(readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]);
-			return true;
-		} catch { return false; }
-	};
-	try {
-		for (const [session, reload] of [["old", false], ["new", true]] as const) {
-			await p.call("load", { session, reload });
-			await p.call("call", { session, input: task() });
-		}
-		const stats = await p.call("stats");
-		assert.equal(stats.modules, 2);
-		pids.push(...stats.owners.flatMap((owner: any) => owner.pids));
-		assert.equal(pids.length, 2);
-		p.child.send({ id: "exit", op: "exit" });
-		await p.closed;
-		await until(() => pids.every((pid) => !running(pid)), 5_000);
-	} finally {
-		// Only the exact fixture-owned PIDs, never real Pi sessions, even if this regression fails.
-		for (const pid of pids) if (running(pid)) { try { process.kill(pid, "SIGKILL"); } catch {} }
-		await p.dispose(); repo.dispose();
-	}
-});
-
-test("old stubborn cleanup overlaps a new loader session without killing or blocking it", { timeout: 30_000 }, async () => {
-	const repo = workspace(); const p = await parent(repo.cwd);
-	try {
-		await p.call("load", { session: "old" });
-		const oldWork = p.call("call", { session: "old", input: task("stubborn") });
-		void oldWork.catch(() => {}); // Also observe teardown rejection if an assertion fails first.
-		let ready = false;
-		const deadline = Date.now() + 5_000;
-		while (!ready && Date.now() < deadline) {
-			ready = !!(await p.call("stats")).owners[0]?.ready;
-			if (!ready) await new Promise((resolve) => setTimeout(resolve, 10));
-		}
-		assert.equal(ready, true, "child installed its SIGTERM handler before shutdown");
-		const closing = p.call("shutdown", { session: "old" });
-		await p.call("load", { session: "new", reload: true });
-		const fresh = await p.call("call", { session: "new", input: task() });
-		assert.equal(fresh.status, "waiting_for_reply");
-		await closing;
-		const cancelled = await oldWork;
-		assert.equal(cancelled.result.execution.termination_source, "session_shutdown");
-		assert.equal(cancelled.result.execution.termination.source, "session_shutdown");
-		assert.equal((await p.call("call", { session: "new", input: reply(fresh) })).result.status, "completed");
-		assert.equal((await p.call("stats")).owners.length, 0);
-	} finally { await p.dispose(); repo.dispose(); }
-});
-
-test("actual parent socket error cannot be caught into a successful worker result; cleanup allows the next batch", { timeout: 30_000 }, async () => {
+test("model-free child returns blocked without interaction and next batch can run", { timeout: 15_000 }, async () => {
 	const repo = workspace(); const p = await parent(repo.cwd);
 	try {
 		await p.call("load");
-		const pending = await p.call("call", { input: task("catch") });
-		await p.call("socket-error");
-		const result = await p.call("call", { input: { batchId: pending.batchId } });
+		const result = await p.call("call", { input: task("blocked") });
 		assert.equal(result.finished, true);
-		assert.equal(result.result.status, "failed");
-		assert.equal(result.result.failure.category, "ipc_failure");
-		assert.equal(result.result.execution.termination.code, "ECONNRESET");
-		assert.equal(result.result.execution.termination.source, "transport");
-		assert.equal(result.result.execution.cancelled, false);
-		assert.equal(result.history[0].status, "cancelled");
-		assert.equal((await p.call("stats")).owners.length, 0);
+		assert.equal(result.result.status, "blocked");
+		assert.equal(result.result.failure.category, "worker_blocked");
+		assertReleased(await p.call("stats"));
 		assert.equal((await p.call("call", { input: task("done") })).result.status, "completed");
 	} finally { await p.dispose(); repo.dispose(); }
 });
-
 
 test("cancel retains original PGID, slot and runtime lock after leader closes until resistant grandchild is killed", { timeout: 20_000, skip: process.platform !== "linux" }, async (t) => {
 	const repo = workspace(); const p = await parent(repo.cwd);

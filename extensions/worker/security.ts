@@ -113,10 +113,6 @@ function rangesOverlap(left: WriteBoundary["ranges"][number], right: WriteBounda
 	return isSameOrAncestor(left.root, right.root) || isSameOrAncestor(right.root, left.root);
 }
 
-export function workerTasksConflict(left: WorkerTask, right: WorkerTask, baseCwd: string): boolean {
-	return workerTaskScopesConflict(left, baseCwd, right, baseCwd);
-}
-
 /** Cross-batch tasks may have different session cwd snapshots. */
 export function workerTaskScopesConflict(left: WorkerTask, leftCwd: string, right: WorkerTask, rightCwd: string): boolean {
 	const leftWrites = WRITE_MODES.has(left.mode);
@@ -168,63 +164,6 @@ export function attributeChangedFiles(
 		observedChangedFiles: observed,
 		attributedToDeclaredPaths: hadConcurrentWriter,
 	};
-}
-
-export interface ConflictExecutionContext {
-	/** Mutable for the lifetime of the task so earlier starters see later overlap. */
-	readonly overlappingIndices: ReadonlySet<number>;
-}
-
-/** Ordered, failure-isolated scheduler that scans past a conflicting queue head. */
-export async function mapWithConflicts<T, R>(
-	items: T[],
-	limit: number,
-	conflicts: (left: T, right: T) => boolean,
-	fn: (item: T, index: number, execution: ConflictExecutionContext) => Promise<R>,
-): Promise<R[]> {
-	if (items.length === 0) return [];
-	const results = new Array<R>(items.length);
-	const pending = items.map(() => true);
-	const active = new Set<number>();
-	const contexts = items.map(() => ({ overlappingIndices: new Set<number>() }));
-	let remaining = items.length;
-	const concurrency = Math.max(1, Math.min(Math.floor(limit) || 1, items.length));
-	return await new Promise<R[]>((resolve) => {
-		const schedule = () => {
-			if (remaining === 0) { resolve(results); return; }
-			while (active.size < concurrency) {
-				let selected = -1;
-				for (let index = 0; index < items.length; index++) {
-					if (!pending[index]) continue;
-					const compatibleWithActive = [...active].every((running) => !conflicts(items[index], items[running]));
-					const preservesConflictOrder = pending.slice(0, index).every((isPending, earlier) =>
-						!isPending || !conflicts(items[index], items[earlier]));
-					if (compatibleWithActive && preservesConflictOrder) { selected = index; break; }
-				}
-				if (selected < 0) return;
-				pending[selected] = false;
-				for (const running of active) {
-					contexts[selected].overlappingIndices.add(running);
-					contexts[running].overlappingIndices.add(selected);
-				}
-				active.add(selected);
-				let execution: Promise<R>;
-				try { execution = Promise.resolve(fn(items[selected], selected, contexts[selected])); }
-				catch (error) { execution = Promise.reject(error); }
-				execution
-					.then((result) => { results[selected] = result; })
-					.catch((error) => {
-						results[selected] = { status: "failed", summary: [error instanceof Error ? error.message : String(error)] } as R;
-					})
-					.finally(() => {
-						active.delete(selected);
-						remaining--;
-						schedule();
-					});
-			}
-		};
-		schedule();
-	});
 }
 
 export async function runCommand(command: string, args: string[], cwd: string, options: RunCommandOptions = {}): Promise<CommandResult> {

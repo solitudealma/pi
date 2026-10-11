@@ -2,6 +2,7 @@
 
 
 export type WorkerMode = "scout" | "implement" | "test" | "review" | "fix";
+export type WorkerSessionMode = "new" | "fork";
 export type WorkerPreset = "auto" | "fast" | "normal" | "deep";
 export type Thinking = "high" | "xhigh" | "max";
 export type ResolvedPreset = Exclude<WorkerPreset, "auto">;
@@ -10,6 +11,8 @@ export interface WorkerTask {
 	mode: WorkerMode;
 	objective: string;
 	preset?: WorkerPreset;
+	/** Defaults to fork: snapshots the parent's active branch at batch admission. */
+	sessionMode?: WorkerSessionMode;
 	context?: string;
 	relevantFiles?: string[];
 	allowedPaths?: string[];
@@ -20,22 +23,13 @@ export interface WorkerTask {
 	cwd?: string;
 }
 
-export interface WorkerAnswer {
-	taskId: string;
-	questionId: string;
-	answer: string;
-}
-
 export interface WorkerToolInput {
 	task?: WorkerTask;
 	tasks?: WorkerTask[];
 	/** Required for calls made while automatic delegation is disabled in routing config. */
 	manual?: boolean;
 	batchId?: string;
-	answers?: WorkerAnswer[];
 	cancel?: true;
-	/** History page in the next question/completion response; never a polling timeout. */
-	questionOffset?: number;
 }
 
 export interface PresetConfig {
@@ -108,6 +102,7 @@ export interface WorkerUiTask {
 	objective: string;
 	status: WorkerUiStatus;
 	requestedPreset: WorkerPreset;
+	sessionMode?: WorkerSessionMode;
 	resolvedPreset?: ResolvedPreset;
 	modelId?: string;
 	thinking?: Thinking;
@@ -129,7 +124,6 @@ export interface WorkerUiDetails {
 	controlErrors?: Array<{ toolCallId: string; message: string }>;
 	/** Capture time for static history; elapsed times must not keep advancing. */
 	snapshotAt?: number;
-	questions?: import("./runtime.ts").QuestionRecord[];
 	startedAt: number;
 	finishedAt?: number;
 	limit: number;
@@ -147,7 +141,7 @@ export interface ChildResult {
 	actualModel?: string;
 	stopReason?: string;
 	errorMessage?: string;
-	termination?: { stage: "ipc" | "process" | "spawn" | "slot"; code: string; source: string; parentPid: number; workerPid?: number; ownerId: string };
+	termination?: { stage: "process" | "spawn" | "slot"; code: string; source: string; parentPid: number; workerPid?: number; ownerId: string };
 	aborted: boolean;
 	timedOut: boolean;
 	truncated: boolean;

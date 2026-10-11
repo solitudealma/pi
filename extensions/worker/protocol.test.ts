@@ -1,15 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import workerExtension, { validateWorkerInput } from "./index.ts";
+import workerExtension, { validateWorkerInput, batchResponse, batchUiSnapshot } from "./index.ts";
+import { WorkerRuntime } from "./runtime.ts";
 import { DEFAULT_OPTIONS } from "./config.ts";
+import { compactWorkerResult } from "./ui.ts";
 import type { executeTask } from "./process.ts";
-import { until } from "./fixtures/helpers.ts";
+import { until, start, task as writeTask } from "./fixtures/helpers.ts";
 
 const complete = { status: "completed", summary: ["done"] };
 const task = { mode: "scout", objective: "fixture" };
-const answer = { taskId: "task", questionId: "question", answer: "yes" };
 const payload = (result: any) => JSON.parse(result.content[0].text);
-const answersFor = (result: any) => result.questions.map((q: any) => ({ taskId: q.taskId, questionId: q.id, answer: `answer ${q.id}` }));
 function deferred() {
 	let resolve!: () => void;
 	const promise = new Promise<void>((done) => { resolve = done; });
@@ -37,66 +37,130 @@ function harness(execute: typeof executeTask, automaticDelegationEnabled = true,
 	const tool = tools.get("worker");
 	return {
 		tools, loads: () => loads,
-		call: (input: any, signal?: AbortSignal) => tool.execute("fixture-call", input, signal, undefined, { cwd: process.cwd(), hasUI: false }),
+		call: (input: any, signal?: AbortSignal) => tool.execute("fixture-call", input, signal, undefined, { cwd: process.cwd(), hasUI: false, sessionManager: { getBranch: () => [] } }),
 		close: () => handlers.get("session_shutdown")({}),
 	};
 }
 
-test("single-tool input modes strictly reject mixed, missing, unknown and malformed fields", () => {
+
+test("only start, continue and cancel inputs are accepted", () => {
+	for (const input of [{ task }, { tasks: [task], manual: true }, { batchId: "batch" }, { batchId: "batch", cancel: true }]) {
+		assert.doesNotThrow(() => validateWorkerInput(input));
+	}
 	for (const input of [
-		{ task }, { tasks: [task], manual: true }, { task, manual: false },
-		{ batchId: "batch" }, { batchId: "batch", answers: [answer] },
-		{ batchId: "batch", cancel: true }, { batchId: "batch", questionOffset: 0 },
-		{ batchId: "batch", answers: [answer], questionOffset: 8 },
-	]) assert.doesNotThrow(() => validateWorkerInput(input));
-	for (const input of [
-		undefined, null, [], {}, { task, tasks: [task] }, { task: null }, { tasks: [] },
-		{ tasks: Array(13).fill(task) }, { task: { ...task, mode: "invalid" } },
-		{ task: { ...task, objective: 1 } }, { task: { ...task, unknown: true } },
-		{ task: { ...task, preset: "max" } }, { task: { ...task, userExplicitMax: true } },
-		{ task: { ...task, allowedPaths: [1] } }, { task, manual: "yes" },
-		{ task, waitMs: 0 }, { task, batchId: "batch" }, { tasks: [task], batchId: "batch" },
-		{ answers: [answer] }, { cancel: true }, { questionOffset: 0 },
-		{ task, answers: [answer] }, { task, cancel: true }, { task, questionOffset: 0 },
-		{ batchId: "" }, { batchId: " " }, { batchId: 1 }, { batchId: "batch", manual: false },
-		{ batchId: "batch", cancel: false }, { batchId: "batch", cancel: true, answers: [answer] },
-		{ batchId: "batch", cancel: true, questionOffset: 0 }, { batchId: "batch", waitMs: 0 },
-		{ batchId: "batch", questionOffset: -1 }, { batchId: "batch", questionOffset: 1.5 },
-		{ batchId: "batch", answers: [] }, { batchId: "batch", answers: Array(385).fill(answer) },
-		{ batchId: "batch", answers: [null] }, { batchId: "batch", answers: [{ ...answer, answer: 1 }] },
-		{ batchId: "batch", answers: [{ ...answer, answer: "" }] },
-		{ batchId: "batch", answers: [{ ...answer, answer: "x".repeat(4001) }] },
-		{ batchId: "batch", answers: [{ ...answer, taskId: "" }] },
-		{ batchId: "batch", answers: [{ ...answer, extra: true }] },
-	]) assert.throws(() => validateWorkerInput(input), /参数错误/, JSON.stringify(input));
+		undefined, null, [], {}, { task, tasks: [task] }, { tasks: [] }, { tasks: Array(13).fill(task) },
+		{ task: { ...task, mode: "invalid" } }, { task: { ...task, preset: "max" } },
+		{ task: { ...task, unknown: true } }, { task, manual: "yes" }, { task, waitMs: 0 },
+		{ task, batchId: "batch" }, { task, cancel: true }, { batchId: "" }, { batchId: " " },
+		{ batchId: "batch", manual: true }, { batchId: "batch", cancel: false },
+		{ batchId: "batch", answers: [{ taskId: "t", questionId: "q", answer: "yes" }] },
+		{ batchId: "batch", questionOffset: 0 },
+	]) assert.throws(() => validateWorkerInput(input), /参数错误/);
 });
 
-test("invalid starts admit no work; continuations bypass routing/delegation settings and never create batches", async () => {
+test("continuations preserve completed results and do not reload settings or admit work", async () => {
 	let starts = 0;
-	const h = harness(async (_task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-		starts++;
-		await ask!({ id: "one", question: "Continue?", timeoutMs: 5_000 }, signal!);
-		return complete;
-	}, false);
+	const h = harness(async () => { starts++; return structuredClone(batchResultFixture); }, false);
+	const expected = { ...compactWorkerResult(batchResultFixture), observed_changed_files: batchResultFixture.observed_changed_files };
 	try {
 		assert.deepEqual([...h.tools.keys()], ["worker"]);
 		await assert.rejects(h.call({ task, tasks: [task] }), /参数错误/);
 		assert.equal(h.loads(), 0);
 		assert.equal(payload(await h.call({ task })).status, "blocked");
 		assert.equal(starts, 0);
-		const first = payload(await h.call({ task, manual: true }));
-		const loads = h.loads();
-		const continued = payload(await h.call({ batchId: first.batchId }));
-		assert.equal(continued.batchId, first.batchId);
-		assert.equal(continued.questions[0].id, "one");
-		const done = payload(await h.call({ batchId: first.batchId, answers: answersFor(first) }));
-		assert.equal(done.finished, true);
-		assert.equal(done.batchId, first.batchId);
-		assert.equal(starts, 1);
-		assert.equal(h.loads(), loads);
+		for (const input of [{ task }, { tasks: [task, task] }]) {
+			const first = await h.call({ ...input, manual: true });
+			assert.deepEqual(first.details.payload.result, input.task ? expected : { status: "completed", results: [expected, expected] });
+			const loads = h.loads();
+			const calls: number = starts;
+			const continued = await h.call({ batchId: first.details.batchId });
+			assert.deepEqual(continued.content, first.content);
+			assert.equal(first.content[0].text, JSON.stringify(payload(first)));
+			assert.deepEqual(continued.details, { ...first.details, snapshotAt: continued.details.snapshotAt });
+			assert.equal(payload(await h.call({ batchId: first.details.batchId, cancel: true })).finished, true);
+			assert.equal(h.loads(), loads);
+			assert.equal(starts, calls);
+		}
+		assert.equal(starts, 3);
 		await assert.rejects(h.call({ batchId: "foreign" }), /未知/);
 	} finally { await h.close(); }
 });
+
+test("blocked worker results return immediately without a waiting state or legacy response fields", async () => {
+	const h = harness(async () => ({ status: "blocked", summary: ["Need a decision"], recommended_next_action: ["Provide context in a new contract"] }));
+	try {
+		const result = payload(await h.call({ task }));
+		assert.equal(result.finished, true);
+		assert.equal(result.status, "blocked");
+		assert.equal(result.tasks[0].status, "blocked");
+		assert.equal(result.result.status, "blocked");
+		assert.deepEqual(Object.keys(result).sort(), ["batchId", "finished", "next_action", "result", "status", "tasks"]);
+		assert.equal(payload(await h.call({ task })).finished, true);
+	} finally { await h.close(); }
+});
+
+test("cancel waits for cleanup, cancels queued siblings and prevents new admission until released", async () => {
+	const cleanup = deferred(), running = deferred();
+	let starts = 0, aborted = false;
+	const h = harness(async (_task, _config, _warnings, _ctx, signal) => {
+		if (++starts === 1) {
+			running.resolve();
+			await new Promise<void>((resolve) => signal!.addEventListener("abort", () => { aborted = true; resolve(); }, { once: true }));
+			await cleanup.promise;
+		}
+		return complete;
+	}, true, 1);
+	try {
+		const write = { mode: "implement", objective: "same", allowedPaths: ["same.ts"] };
+		const first = h.call({ tasks: [write, write] });
+		await running.promise;
+		const blocked = payload(await h.call({ task: write }));
+		let returned = false;
+		const cancellation = h.call({ batchId: blocked.activeBatchId, cancel: true }).then((value: any) => { returned = true; return value; });
+		await until(() => aborted);
+		assert.equal(returned, false);
+		assert.equal(payload(await h.call({ task: write })).activeBatchId, blocked.activeBatchId);
+		cleanup.resolve();
+		const done = payload(await cancellation);
+		assert.equal(done.finished, true);
+		assert.ok(done.tasks.every((item: any) => item.status === "failed"));
+		assert.equal(payload(await first).finished, true);
+		assert.equal(payload(await h.call({ task: write })).finished, true);
+		assert.equal(starts, 2);
+	} finally { cleanup.resolve(); await h.close(); }
+});
+
+for (const mode of ["initial", "continue", "pre-continue"] as const) {
+	test(`${mode} invocation abort cancels and awaits cleanup`, async () => {
+		const running = deferred(), cleanup = deferred();
+		let aborted = false;
+		const h = harness(async (_task, _config, _warnings, _ctx, signal) => {
+			running.resolve();
+			await new Promise<void>((resolve) => signal!.addEventListener("abort", () => { aborted = true; resolve(); }, { once: true }));
+			await cleanup.promise; return complete;
+		});
+		try {
+			const controller = new AbortController();
+			const first = h.call({ task }, mode === "initial" ? controller.signal : undefined);
+			await running.promise;
+			let invocation = first;
+			if (mode !== "initial") {
+				const blocked = payload(await h.call({ task }));
+				if (mode === "pre-continue") controller.abort();
+				invocation = h.call({ batchId: blocked.activeBatchId }, controller.signal);
+			}
+			let returned = false;
+			void invocation.then(() => { returned = true; });
+			controller.abort(); await until(() => aborted);
+			assert.equal(returned, false);
+			cleanup.resolve();
+			const done = payload(await invocation);
+			assert.equal(done.finished, true);
+			assert.equal(done.result.execution.cancelled, true);
+			await first;
+		} finally { cleanup.resolve(); await h.close(); }
+	});
+}
 
 test("one invalid directory scope rejects the entire batch before routing or subprocess execution", async () => {
 	let starts = 0;
@@ -116,104 +180,8 @@ test("one invalid directory scope rejects the entire batch before routing or sub
 	} finally { await h.close(); }
 });
 
-test("batch answers are atomic, reject foreign/duplicate IDs and support parallel multi-round Q&A", async () => {
-	let answered = 0;
-	const h = harness(async (task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-		for (let round = 1; round <= 2; round++) {
-			const id = `${task.objective}-${round}`;
-			assert.equal(await ask!({ id, question: `Round ${round}`, timeoutMs: 5_000 }, signal!), `answer ${id}`);
-			answered++;
-		}
-		return complete;
-	});
-	try {
-		const first = payload(await h.call({ tasks: [{ ...task, objective: "a" }, { ...task, objective: "b" }] }));
-		assert.equal(first.questions.length, 2);
-		const good = answersFor(first);
-		for (const [invalid, pattern] of [
-			[[good[0], good[0]], /重复/],
-			[[good[0], { ...good[1], taskId: "foreign" }], /跨批次/],
-			[[good[0], { ...good[1], questionId: "foreign" }], /未知/],
-			[[good[0], { ...good[1], questionId: good[0].questionId }], /跨任务/],
-			[[good[0], { ...good[1], answer: "  " }], /回答为空/],
-		] as const) {
-			await assert.rejects(h.call({ batchId: first.batchId, answers: invalid }), pattern);
-			assert.equal(answered, 0);
-			assert.equal(payload(await h.call({ batchId: first.batchId })).questions.length, 2);
-		}
-		const next = payload(await h.call({ batchId: first.batchId, answers: good }));
-		assert.equal(answered, 2);
-		assert.equal(next.finished, false);
-		assert.deepEqual(next.questions.map((q: any) => q.id), ["a-2", "b-2"]);
-		await assert.rejects(h.call({ batchId: first.batchId, answers: good }), /重复/);
-		const done = payload(await h.call({ batchId: first.batchId, answers: answersFor(next) }));
-		assert.equal(done.batchId, first.batchId);
-		assert.equal(done.finished, true);
-		assert.equal(answered, 4);
-		assert.deepEqual(done.result.results.map((item: any) => item.status), ["completed", "completed"]);
-		assert.ok(done.history.every((q: any) => q.status === "answered"));
-	} finally { await h.close(); }
-});
 
-test("partial answers return unanswered questions immediately and actual foreign batch IDs are rejected", async () => {
-	const h = harness(async (task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-		await ask!({ id: task.objective, question: "Q", timeoutMs: 5_000 }, signal!);
-		return complete;
-	});
-	try {
-		const first = payload(await h.call({ tasks: [{ ...task, objective: "a" }, { ...task, objective: "b" }] }));
-		assert.equal(payload(await h.call({ task: { ...task, objective: "foreign" } })).activeBatchId, first.batchId);
-		assert.equal(payload(await h.call({ batchId: first.batchId })).questions.length, 2);
-		const partial = payload(await h.call({ batchId: first.batchId, answers: [answersFor(first)[0]] }));
-		assert.equal(partial.finished, false);
-		assert.deepEqual(partial.questions.map((q: any) => q.id), ["b"]);
-		assert.equal(payload(await h.call({ batchId: first.batchId, answers: answersFor(partial) })).finished, true);
-		const foreign = payload(await h.call({ task: { ...task, objective: "foreign" } }));
-		const again = payload(await h.call({ task }));
-		assert.equal(again.activeBatchId, foreign.batchId);
-		await assert.rejects(h.call({ batchId: foreign.batchId, answers: [{ ...answersFor(foreign)[0], taskId: first.tasks[0].taskId }] }), /跨批次/);
-		assert.equal(payload(await h.call({ batchId: foreign.batchId, cancel: true })).finished, true);
-	} finally { await h.close(); }
-});
-
-test("same-turn concurrent starts reject the second immediately while the first question remains answerable", async () => {
-	let starts = 0;
-	const h = harness(async (running, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-		starts++;
-		if (running.objective === "ask") await ask!({ id: "prompt", question: "Choose?", timeoutMs: 5_000 }, signal!);
-		return complete;
-	}, true, 1);
-	try {
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("second start waited for the first question")), 1_000); });
-		let first: any;
-		let refused: any;
-		try {
-			[first, refused] = await Promise.race([Promise.all([
-				h.call({ task: { ...task, objective: "ask" } }),
-				h.call({ task: { ...task, objective: "other" } }),
-			]), deadline]);
-		} finally { clearTimeout(timer); }
-		const pending = payload(first);
-		const blocked = payload(refused);
-		assert.equal(pending.finished, false);
-		assert.equal(pending.questions[0].id, "prompt");
-		assert.equal(blocked.status, "blocked");
-		assert.equal(blocked.error, "active_batch");
-		assert.equal(blocked.activeBatchId, pending.batchId);
-		assert.match(blocked.next_action, /answers.*继续等待.*cancel/);
-		assert.equal(starts, 1, "rejected invocation must not admit another task");
-		const sequential = payload(await h.call({ task }));
-		assert.equal(sequential.activeBatchId, pending.batchId);
-		const done = payload(await h.call({ batchId: pending.batchId, answers: answersFor(pending) }));
-		assert.equal(done.finished, true);
-		assert.equal(done.history[0].status, "answered");
-		assert.equal(payload(await h.call({ task })).finished, true);
-		assert.equal(starts, 2);
-	} finally { await h.close(); }
-});
-
-test("a second start is rejected while the first still waits without any question", async () => {
+test("a second start is rejected while the first still waits before completion", async () => {
 	const finish = deferred();
 	let starts = 0;
 	const h = harness(async () => { starts++; await finish.promise; return complete; }, true, 1);
@@ -234,91 +202,8 @@ test("a second start is rejected while the first still waits without any questio
 	} finally { finish.resolve(); await h.close(); }
 });
 
-test("single-tool cancel waits for cleanup and refuses new batches until released", async () => {
-	const cleanup = deferred();
-	let starts = 0;
-	let aborted = false;
-	const h = harness(async (_task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-		if (++starts === 1) {
-			try { await ask!({ id: "cancel", question: "Q", timeoutMs: 5_000 }, signal!); }
-			finally { aborted = signal!.aborted; await cleanup.promise; }
-		}
-		return complete;
-	});
-	try {
-		const write = { mode: "implement", objective: "same path", allowedPaths: ["same.ts"] };
-		const first = payload(await h.call({ tasks: [write, write] }));
-		let cancelledReturned = false;
-		const cancellation = h.call({ batchId: first.batchId, cancel: true }).then((value: any) => { cancelledReturned = true; return value; });
-		const second = payload(await h.call({ task: write }));
-		assert.equal(second.status, "blocked");
-		assert.equal(second.activeBatchId, first.batchId);
-		await until(() => aborted);
-		assert.equal(cancelledReturned, false);
-		assert.equal(starts, 1);
-		cleanup.resolve();
-		const cancelled = payload(await cancellation);
-		assert.equal(cancelled.finished, true);
-		assert.ok(cancelled.tasks.every((t: any) => t.status === "failed"));
-		assert.equal(cancelled.questions.length, 0);
-		assert.equal(payload(await h.call({ task: write })).finished, true);
-		assert.equal(starts, 2, "queued sibling was cancelled; only the next batch starts");
-		assert.equal(payload(await h.call({ batchId: first.batchId, cancel: true })).finished, true);
-	} finally { cleanup.resolve(); await h.close(); }
-});
 
-for (const mode of ["initial", "answer", "continue", "pre-answer", "pre-continue"] as const) {
-	test(`${mode} invocation abort cancels its batch, skips pre-aborted answers and awaits cleanup`, async () => {
-		const running = deferred();
-		const cleanup = deferred();
-		let aborted = false;
-		let answered = false;
-		const h = harness(async (_task, _config, _warnings, _ctx, signal, _progress, _overlap, ask) => {
-			running.resolve();
-			try {
-				if (mode !== "initial") {
-					await ask!({ id: "abort", question: "Q", timeoutMs: 5_000 }, signal!);
-					answered = true;
-				}
-				await new Promise<void>((resolve) => {
-					if (signal!.aborted) resolve(); else signal!.addEventListener("abort", () => resolve(), { once: true });
-				});
-			} finally { aborted = signal!.aborted; await cleanup.promise; }
-			return complete;
-		});
-		try {
-			const controller = new AbortController();
-			let invocation: Promise<any>;
-			let answerWait: Promise<any> | undefined;
-			if (mode === "initial") {
-				invocation = h.call({ task }, controller.signal);
-				await running.promise;
-			} else {
-				const first = payload(await h.call({ task }));
-				if (mode.startsWith("pre-")) controller.abort();
-				if (mode === "continue") {
-					answerWait = h.call({ batchId: first.batchId, answers: answersFor(first) });
-					await until(() => answered);
-				}
-				invocation = h.call({ batchId: first.batchId, ...(mode.endsWith("answer") ? { answers: answersFor(first) } : {}) }, controller.signal);
-			}
-			let returned = false;
-			void invocation.then(() => { returned = true; });
-			controller.abort();
-			await until(() => aborted);
-			assert.equal(returned, false);
-			cleanup.resolve();
-			const done = payload(await invocation);
-			assert.equal(done.finished, true);
-			assert.equal(done.result.status, "failed");
-			assert.equal(done.result.execution.cancelled, true);
-			if (mode.startsWith("pre-")) assert.equal(answered, false);
-			if (answerWait) assert.equal(payload(await answerWait).finished, true);
-		} finally { cleanup.resolve(); await h.close(); }
-	});
-}
-
-test("pre-aborted start admits no worker; completion without questions waits beyond 30 seconds", async (t) => {
+test("pre-aborted start admits no worker; completion  waits beyond 30 seconds", async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const finish = deferred();
 	let starts = 0;
@@ -338,6 +223,7 @@ test("pre-aborted start admits no worker; completion without questions waits bey
 		assert.equal(starts, 1);
 	} finally { finish.resolve(); await h.close(); t.mock.timers.reset(); }
 });
+
 
 test("session shutdown wakes an indefinite invocation only after cleanup completes", async () => {
 	const running = deferred();
@@ -364,6 +250,7 @@ test("session shutdown wakes an indefinite invocation only after cleanup complet
 	} finally { cleanup.resolve(); await h.close(); }
 });
 
+
 test("task timeout wakes an indefinite tool wait and returns cleanup-complete failure", async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const running = deferred();
@@ -381,4 +268,42 @@ test("task timeout wakes an indefinite tool wait and returns cleanup-complete fa
 		assert.equal(done.result.failure.category, "timeout");
 		assert.equal(done.result.execution.timed_out, true);
 	} finally { await h.close(); t.mock.timers.reset(); }
+});
+
+const batchResultFixture = {
+	status: "completed",
+	execution: { requested_preset: "fast", resolved_preset: "fast", actual_model_id: "fixture/local", actual_thinking: "high", attempt: 1, warnings: [], usage: { input: 42, output: 17, cacheRead: 0, cacheWrite: 0, contextTokens: 59, turns: 1 } },
+	failure: null,
+	summary: ["保留中文、空格  和换行\n第二行", 'Quotes: "fixture", path: C:\\fixture'],
+	changed_files: ["src/fixture.ts"],
+	observed_changed_files: ["src/fixture.ts", "tests/fixture.ts"],
+	validation: [{ command: "fixture test", result: "passed", details: "2 checks" }],
+	acceptance: [{ criterion: "preserve data", result: "passed", evidence: "fixture" }],
+	findings: [{ severity: "info", file: "src/fixture.ts", location: "1", problem: "fixture only", evidence: "none", impact: "none", recommendation: "none", confidence: 1 }],
+	risks: ["fixture risk"],
+	out_of_scope: ["fixture exclusion"],
+	recommended_next_action: ["Review actual diff."],
+};
+
+test("single and multi batch JSON is compact and preserves fields and detached UI details", async (t) => {
+	t.mock.method(Date, "now", () => 1_700_000_000_000);
+	const runtime = new WorkerRuntime(() => false);
+	t.after(() => runtime.dispose());
+	for (const count of [1, 2]) {
+		const batch = start(runtime, Array.from({ length: count }, (_, i) => writeTask(`fixture${i}.ts`)), async () => structuredClone(batchResultFixture));
+		await runtime.wait(batch.id);
+		const expectedPayload = {
+			batchId: batch.id, status: "completed", finished: true,
+			tasks: batch.tasks.map((item) => ({ taskId: item.id, status: "completed" })),
+			result: count === 1 ? batchResultFixture : { status: "completed", results: Array(count).fill(batchResultFixture) },
+			next_action: "Review results and actual diff.",
+		};
+		const expectedDetails = { ...batchUiSnapshot(batch), payload: expectedPayload };
+		const beforeUi = structuredClone(batch.ui);
+		const result = batchResponse(batch);
+		assert.deepEqual(result.content, [{ type: "text", text: JSON.stringify(expectedPayload) }]);
+		assert.ok(Buffer.byteLength(result.content[0].text) < Buffer.byteLength(JSON.stringify(expectedPayload, null, 2)));
+		assert.deepEqual(result.details, expectedDetails);
+		assert.deepEqual(batch.ui, beforeUi);
+	}
 });

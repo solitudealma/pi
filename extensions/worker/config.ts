@@ -8,8 +8,8 @@ import type { PresetConfig, ResolvedPreset, Route, RoutingConfig, Thinking, Work
 
 export const MODES = ["scout", "implement", "test", "review", "fix"] as const;
 export const PRESETS = ["auto", "fast", "normal", "deep"] as const;
+export const SESSION_MODES = ["new", "fork"] as const;
 export const WRITE_MODES = new Set<WorkerMode>(["implement", "test", "fix"]);
-export const READ_ONLY_MODES = new Set<WorkerMode>(["scout", "review"]);
 export const RESOLVED_PRESETS = ["fast", "normal", "deep"] as const;
 
 export const DEFAULT_OPTIONS = {
@@ -112,6 +112,7 @@ export function validateTask(task: WorkerTask, baseCwd: string): string[] {
 	if (!MODES.includes(task.mode)) errors.push(`无效 mode: ${String(task.mode)}`);
 	if (!task.objective || !task.objective.trim()) errors.push("objective 不能为空");
 	if (task.preset && !PRESETS.includes(task.preset)) errors.push(`无效 preset: ${String(task.preset)}`);
+	if (task.sessionMode !== undefined && !SESSION_MODES.includes(task.sessionMode)) errors.push(`无效 sessionMode: ${String(task.sessionMode)}`);
 	if (WRITE_MODES.has(task.mode) && (!task.allowedPaths || task.allowedPaths.length === 0)) errors.push(`${task.mode} 必须提供非空 allowedPaths`);
 	for (const file of task.relevantFiles ?? []) {
 		if (!file.trim()) errors.push("relevantFiles 不能包含空路径");

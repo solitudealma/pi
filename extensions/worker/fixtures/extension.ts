@@ -26,10 +26,10 @@ export default function fixtureExtension(pi: ExtensionAPI) {
 	};
 	workerExtension(pi, {
 		executeTask: (...args: Parameters<typeof executeTask>) => {
-			(state.__workerFixtureOwners ??= new Set()).add(args[9]);
+			(state.__workerFixtureOwners ??= new Set()).add(args[8]);
 			const progress = args[5];
 			args[5] = (patch) => {
-				if (patch.activities?.some((activity) => activity.id === "tool:fixture-ready")) (state.__workerFixtureReady ??= new Set()).add(args[9]?.id);
+				if (patch.activities?.some((activity) => activity.id === "tool:fixture-ready")) (state.__workerFixtureReady ??= new Set()).add(args[8]?.id);
 				if (state.__workerFixtureThrowProgress && patch.phase === state.__workerFixtureThrowProgress) {
 					state.__workerFixtureProgressThrows = (state.__workerFixtureProgressThrows ?? 0) + 1;
 					throw new Error("fixture onProgress failure");

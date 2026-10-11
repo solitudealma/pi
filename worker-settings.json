@@ -1,16 +1,16 @@
 {
   "version": 2,
   "fast": {
-    "model": "openai-codex/gpt-6.1-sol",
+    "model": "openai-codex/gpt-6-astra",
     "thinking": "low"
   },
   "normal": {
-    "model": "openai-codex/gpt-6.1-sol",
+    "model": "openai-codex/gpt-6-astra",
     "thinking": "medium"
   },
   "deep": {
     "model": "openai-codex/gpt-6-astra",
-    "thinking": "medium"
+    "thinking": "high"
   },
   "maxConcurrentWorkers": 5,
   "automaticDelegationEnabled": true,
